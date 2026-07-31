@@ -1,0 +1,418 @@
+from __future__ import annotations
+
+import base64
+import subprocess
+import time
+import uuid
+from contextlib import suppress
+from pathlib import Path
+from threading import Event
+
+import dashscope
+import httpx
+import oss2
+from dashscope.audio.qwen_omni import MultiModality, OmniRealtimeCallback, OmniRealtimeConversation
+from dashscope.audio.qwen_omni.omni_realtime import TranscriptionParams
+
+from .config import Settings
+
+
+class AIServiceError(RuntimeError):
+    pass
+
+
+def _headers(key: str | None) -> dict[str, str]:
+    if not key:
+        raise AIServiceError("尚未配置 API 密钥")
+    return {"Authorization": f"Bearer {key}"}
+
+
+def _transcribe_openai_compatible(path: Path, settings: Settings) -> dict:
+    url = settings.stt_base_url.rstrip("/") + "/audio/transcriptions"
+    try:
+        with (
+            path.open("rb") as audio,
+            httpx.Client(timeout=settings.request_timeout_seconds) as client,
+        ):
+            response = client.post(
+                url,
+                headers=_headers(settings.stt_api_key),
+                data={"model": settings.stt_model, "response_format": "verbose_json"},
+                files={"file": (path.name, audio, "audio/mpeg")},
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError, OSError) as exc:
+        raise AIServiceError(f"语音转写请求失败：{exc}") from exc
+    if not payload.get("text") and not payload.get("segments"):
+        raise AIServiceError("语音转写接口返回了空内容")
+    return payload
+
+
+class _QwenASRCallback(OmniRealtimeCallback):
+    def __init__(self) -> None:
+        self.segments: list[dict] = []
+        self.starts: dict[str, float] = {}
+        self.ends: dict[str, float] = {}
+        self.errors: list[str] = []
+        self.language: str | None = None
+        self.session_created = Event()
+
+    def on_open(self) -> None:
+        pass
+
+    def on_close(self, close_status_code, close_msg) -> None:
+        pass
+
+    def on_event(self, response: dict) -> None:
+        event_type = response.get("type")
+        if event_type == "session.created":
+            self.session_created.set()
+        elif event_type == "input_audio_buffer.speech_started":
+            self.starts[response.get("item_id", "")] = (
+                float(response.get("audio_start_ms", 0)) / 1000
+            )
+        elif event_type == "input_audio_buffer.speech_stopped":
+            self.ends[response.get("item_id", "")] = float(response.get("audio_end_ms", 0)) / 1000
+        elif event_type == "conversation.item.input_audio_transcription.completed":
+            text = str(response.get("transcript", "")).strip()
+            item_id = response.get("item_id", "")
+            self.language = response.get("language") or self.language
+            if text:
+                start = self.starts.get(item_id, self.segments[-1]["end"] if self.segments else 0.0)
+                end = max(start, self.ends.get(item_id, start))
+                self.segments.append({"start": start, "end": end, "text": text})
+        elif event_type == "error":
+            error = response.get("error") or {}
+            self.errors.append(str(error.get("message") or error.get("code") or "未知错误"))
+
+
+def _pcm_from_audio(path: Path) -> Path:
+    pcm_path = path.with_suffix(".pcm")
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "s16le",
+        "-acodec",
+        "pcm_s16le",
+        str(pcm_path),
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise AIServiceError("未找到 ffmpeg，无法为千问实时转写转换音频") from exc
+    except subprocess.CalledProcessError as exc:
+        raise AIServiceError(f"转换千问 PCM 音频失败：{exc.stderr[-500:]}") from exc
+    return pcm_path
+
+
+def _qwen_conversation(settings: Settings, callback: _QwenASRCallback) -> OmniRealtimeConversation:
+    _headers(settings.stt_api_key)
+    return OmniRealtimeConversation(
+        model=settings.stt_model,
+        url=settings.stt_base_url,
+        callback=callback,
+        api_key=settings.stt_api_key,
+    )
+
+
+def _configure_qwen_conversation(conversation: OmniRealtimeConversation) -> None:
+    conversation.update_session(
+        output_modalities=[MultiModality.TEXT],
+        enable_turn_detection=True,
+        turn_detection_type="server_vad",
+        turn_detection_threshold=0.2,
+        turn_detection_silence_duration_ms=800,
+        enable_input_audio_transcription=True,
+        transcription_params=TranscriptionParams(
+            language="zh",
+            sample_rate=16000,
+            input_audio_format="pcm",
+        ),
+    )
+
+
+def _transcribe_dashscope_realtime(path: Path, settings: Settings) -> dict:
+    pcm_path = _pcm_from_audio(path)
+    callback = _QwenASRCallback()
+    conversation = _qwen_conversation(settings, callback)
+    try:
+        conversation.connect()
+        if not callback.session_created.wait(timeout=10):
+            raise AIServiceError("千问实时转写连接成功，但未收到 session.created")
+        _configure_qwen_conversation(conversation)
+        with pcm_path.open("rb") as audio:
+            while chunk := audio.read(3200):
+                conversation.append_audio(base64.b64encode(chunk).decode("ascii"))
+                # 3200 bytes = 100 ms 的 16 kHz/16-bit/单声道 PCM。实时接口需按音频速率发送。
+                time.sleep(len(chunk) / 32_000)
+        conversation.end_session(timeout=max(20, settings.request_timeout_seconds))
+    except AIServiceError:
+        raise
+    except Exception as exc:
+        raise AIServiceError(f"千问实时转写失败：{exc}") from exc
+    finally:
+        with suppress(Exception):
+            conversation.close()
+        pcm_path.unlink(missing_ok=True)
+    if callback.errors:
+        raise AIServiceError(f"千问实时转写返回错误：{'; '.join(callback.errors)}")
+    if not callback.segments:
+        raise AIServiceError("千问实时转写未返回有效文本")
+    return {
+        "text": " ".join(segment["text"] for segment in callback.segments),
+        "segments": callback.segments,
+        "language": callback.language or "zh",
+    }
+
+
+def transcribe_audio(path: Path, settings: Settings) -> dict:
+    if settings.stt_provider == "dashscope_realtime":
+        return _transcribe_dashscope_realtime(path, settings)
+    if settings.stt_provider == "dashscope_flash":
+        return _transcribe_dashscope_flash(path, settings)
+    if settings.stt_provider == "dashscope_filetrans":
+        return _transcribe_dashscope_filetrans(path, settings)
+    return _transcribe_openai_compatible(path, settings)
+
+
+def _value(value, key: str, default=None):
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def _transcribe_dashscope_flash(path: Path, settings: Settings) -> dict:
+    _headers(settings.stt_api_key)
+    dashscope.base_http_api_url = settings.stt_base_url.rstrip("/")
+    try:
+        response = dashscope.MultiModalConversation.call(
+            api_key=settings.stt_api_key,
+            model=settings.stt_model,
+            messages=[
+                {"role": "system", "content": [{"text": ""}]},
+                {"role": "user", "content": [{"audio": path.resolve().as_uri()}]},
+            ],
+            result_format="message",
+            asr_options={"enable_lid": True, "enable_itn": False},
+        )
+    except Exception as exc:
+        raise AIServiceError(f"千问 Qwen3-ASR-Flash 转写失败：{exc}") from exc
+
+    status_code = _value(response, "status_code", 200)
+    if status_code != 200:
+        message = _value(response, "message") or _value(response, "code") or status_code
+        raise AIServiceError(f"千问 Qwen3-ASR-Flash 转写失败：{message}")
+    try:
+        output = _value(response, "output")
+        choices = _value(output, "choices", [])
+        message = _value(choices[0], "message")
+        content = _value(message, "content", [])
+        text = "".join(str(_value(item, "text", "")) for item in content).strip()
+    except (IndexError, TypeError) as exc:
+        raise AIServiceError("千问 Qwen3-ASR-Flash 返回结构异常") from exc
+    if not text:
+        raise AIServiceError("千问 Qwen3-ASR-Flash 未返回有效文本")
+    return {"text": text, "segments": [], "language": "unknown"}
+
+
+def _oss_bucket(settings: Settings) -> oss2.Bucket:
+    missing = [
+        name
+        for name, value in {
+            "OSS_ENDPOINT": settings.oss_endpoint,
+            "OSS_BUCKET": settings.oss_bucket,
+            "OSS_ACCESS_KEY_ID": settings.oss_access_key_id,
+            "OSS_ACCESS_KEY_SECRET": settings.oss_access_key_secret,
+        }.items()
+        if not value
+    ]
+    if missing:
+        raise AIServiceError(f"千问文件转写需要 OSS 配置：{', '.join(missing)}")
+    auth = oss2.Auth(settings.oss_access_key_id, settings.oss_access_key_secret)
+    return oss2.Bucket(auth, settings.oss_endpoint, settings.oss_bucket)
+
+
+def _upload_for_filetrans(path: Path, settings: Settings) -> tuple[oss2.Bucket, str, str]:
+    bucket = _oss_bucket(settings)
+    prefix = settings.oss_prefix.strip("/") or "bili-knowledge-stt"
+    object_key = f"{prefix}/{uuid.uuid4().hex}{path.suffix.lower()}"
+    try:
+        bucket.put_object_from_file(object_key, str(path))
+        signed_url = bucket.sign_url("GET", object_key, 7200, slash_safe=True)
+    except oss2.exceptions.OssError as exc:
+        raise AIServiceError(f"上传临时音频到 OSS 失败：{exc}") from exc
+    return bucket, object_key, signed_url
+
+
+def _dashscope_error(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+        output = payload.get("output") or {}
+        return str(output.get("message") or payload.get("message") or response.text[:500])
+    except ValueError:
+        return response.text[:500] or f"HTTP {response.status_code}"
+
+
+def _parse_filetrans_result(payload: dict) -> dict:
+    segments = []
+    texts = []
+    language = None
+    for transcript in payload.get("transcripts") or []:
+        if transcript.get("text"):
+            texts.append(str(transcript["text"]).strip())
+        for sentence in transcript.get("sentences") or []:
+            text = str(sentence.get("text", "")).strip()
+            if not text:
+                continue
+            language = language or sentence.get("language")
+            segments.append(
+                {
+                    "start": float(sentence.get("begin_time", 0)) / 1000,
+                    "end": float(sentence.get("end_time", 0)) / 1000,
+                    "text": text,
+                }
+            )
+    text = " ".join(texts) or " ".join(segment["text"] for segment in segments)
+    if not text:
+        raise AIServiceError("千问文件转写结果中没有文本")
+    return {"text": text, "segments": segments, "language": language or "unknown"}
+
+
+def _transcribe_dashscope_filetrans(path: Path, settings: Settings) -> dict:
+    _headers(settings.stt_api_key)
+    bucket, object_key, signed_url = _upload_for_filetrans(path, settings)
+    headers = {
+        "Authorization": f"Bearer {settings.stt_api_key}",
+        "Content-Type": "application/json",
+    }
+    base_url = settings.stt_base_url.rstrip("/")
+    try:
+        with httpx.Client(timeout=settings.request_timeout_seconds) as client:
+            response = client.post(
+                base_url + "/services/audio/asr/transcription",
+                headers={**headers, "X-DashScope-Async": "enable"},
+                json={
+                    "model": settings.stt_model,
+                    "input": {"file_url": signed_url},
+                    "parameters": {
+                        "channel_id": [0],
+                        "enable_itn": True,
+                        "enable_words": True,
+                    },
+                },
+            )
+            if response.status_code != 200:
+                raise AIServiceError(f"提交千问文件转写失败：{_dashscope_error(response)}")
+            try:
+                task_id = response.json()["output"]["task_id"]
+            except (ValueError, KeyError, TypeError) as exc:
+                raise AIServiceError("千问文件转写提交响应缺少 task_id") from exc
+
+            deadline = time.monotonic() + settings.stt_poll_timeout_seconds
+            while True:
+                if time.monotonic() >= deadline:
+                    raise AIServiceError("等待千问文件转写结果超时")
+                query = client.get(base_url + f"/tasks/{task_id}", headers=headers)
+                if query.status_code != 200:
+                    raise AIServiceError(f"查询千问文件转写失败：{_dashscope_error(query)}")
+                output = query.json().get("output") or {}
+                status = str(output.get("task_status", "")).upper()
+                if status == "SUCCEEDED":
+                    result_url = (output.get("result") or {}).get("transcription_url")
+                    if not result_url:
+                        raise AIServiceError("千问任务成功但没有 transcription_url")
+                    result_response = client.get(result_url)
+                    result_response.raise_for_status()
+                    return _parse_filetrans_result(result_response.json())
+                if status in {"FAILED", "UNKNOWN"}:
+                    message = output.get("message") or output.get("code") or status
+                    raise AIServiceError(f"千问文件转写任务失败：{message}")
+                time.sleep(2)
+    except AIServiceError:
+        raise
+    except (httpx.HTTPError, ValueError, OSError) as exc:
+        raise AIServiceError(f"千问文件转写请求失败：{exc}") from exc
+    finally:
+        with suppress(oss2.exceptions.OssError):
+            bucket.delete_object(object_key)
+
+
+def chat(messages: list[dict], settings: Settings, max_tokens: int = 3000) -> str:
+    url = settings.llm_base_url.rstrip("/") + "/chat/completions"
+    try:
+        with httpx.Client(timeout=settings.request_timeout_seconds) as client:
+            response = client.post(
+                url,
+                headers={**_headers(settings.llm_api_key), "Content-Type": "application/json"},
+                json={
+                    "model": settings.llm_model,
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "max_tokens": max_tokens,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        content = payload["choices"][0]["message"]["content"].strip()
+    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
+        raise AIServiceError(f"知识稿模型请求失败：{exc}") from exc
+    if not content:
+        raise AIServiceError("知识稿模型返回了空内容")
+    return content
+
+
+def test_service(service: str, settings: Settings) -> dict:
+    if service == "llm":
+        result = chat([{"role": "user", "content": "只回复 OK"}], settings, max_tokens=8)
+        return {"service": service, "ok": True, "message": result[:100]}
+    if settings.stt_provider == "dashscope_realtime":
+        callback = _QwenASRCallback()
+        conversation = _qwen_conversation(settings, callback)
+        try:
+            conversation.connect()
+            if not callback.session_created.wait(timeout=10):
+                raise AIServiceError("连接成功，但未收到千问会话确认")
+            return {"service": service, "ok": True, "message": "千问 WebSocket 鉴权成功"}
+        except AIServiceError:
+            raise
+        except Exception as exc:
+            raise AIServiceError(f"千问 STT 连接测试失败：{exc}") from exc
+        finally:
+            with suppress(Exception):
+                conversation.close()
+    if settings.stt_provider == "dashscope_filetrans":
+        _headers(settings.stt_api_key)
+        _oss_bucket(settings)
+        return {
+            "service": service,
+            "ok": True,
+            "message": "千问文件转写与 OSS 配置完整（未发起付费转写）",
+        }
+    if settings.stt_provider == "dashscope_flash":
+        _headers(settings.stt_api_key)
+        return {
+            "service": service,
+            "ok": True,
+            "message": "千问 Qwen3-ASR-Flash 配置完整（未发起付费转写）",
+        }
+    url = settings.stt_base_url.rstrip("/") + "/models"
+    try:
+        with httpx.Client(timeout=20) as client:
+            response = client.get(url, headers=_headers(settings.stt_api_key))
+            response.raise_for_status()
+            response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise AIServiceError(f"STT 服务连接测试失败：{exc}") from exc
+    return {"service": service, "ok": True, "message": "连接成功"}

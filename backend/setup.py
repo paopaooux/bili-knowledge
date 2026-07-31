@@ -1,0 +1,21 @@
+"""Compatibility shim for older pip versions; canonical metadata lives in pyproject.toml."""
+
+from setuptools import find_packages, setup
+
+
+setup(
+    name="bili-knowledge-backend",
+    version="0.1.0",
+    packages=find_packages(),
+    python_requires=">=3.12",
+    install_requires=[
+        "fastapi>=0.115,<1",
+        "uvicorn[standard]>=0.30,<1",
+        "httpx>=0.27,<1",
+        "dashscope>=1.25,<2",
+        "oss2>=2.19,<3",
+        "python-multipart>=0.0.9,<1",
+        "yt-dlp>=2025.1.0",
+    ],
+    extras_require={"dev": ["pytest>=8,<9", "pytest-asyncio>=0.24,<1", "ruff>=0.8,<1"]},
+)

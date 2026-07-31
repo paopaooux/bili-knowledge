@@ -1,0 +1,14 @@
+{
+  "action": "create",
+  "target_path": "文化/占星/星座.md",
+  "title": "星座",
+  "aliases": ["十二星座"],
+  "summary": "占星语境下的星座知识",
+  "sections": {
+    "overview": "星座主题概述。",
+    "knowledge": ["星座知识点。"],
+    "disagreements": [],
+    "sources": ["[示例来源](https://example.test/video?t=10)"]
+  },
+  "related_paths": []
+}

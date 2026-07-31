@@ -1,0 +1,4 @@
+interface:
+  display_name: "Markdown 知识整理"
+  short_description: "把新知识稿分类并安全合并到 Markdown 主题树"
+  default_prompt: "Use $markdown-knowledge-organizer to classify a source note and update the Markdown topic tree safely."
