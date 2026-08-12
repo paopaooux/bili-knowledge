@@ -1,12 +1,12 @@
 {
   "action": "create",
-  "target_path": "文化/占星/星座.md",
-  "title": "星座",
-  "aliases": ["十二星座"],
-  "summary": "占星语境下的星座知识",
+  "target_path": "个人成长/学习方法.md",
+  "title": "学习方法",
+  "aliases": ["高效学习"],
+  "summary": "帮助持续学习与巩固知识的方法",
   "sections": {
-    "overview": "星座主题概述。",
-    "knowledge": ["星座知识点。"],
+    "overview": "学习方法主题概述。",
+    "knowledge": ["定期复盘有助于巩固所学知识。"],
     "disagreements": [],
     "sources": ["[示例来源](https://example.test/video?t=10)"]
   },

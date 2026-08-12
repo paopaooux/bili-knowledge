@@ -1,0 +1,4 @@
+interface:
+  display_name: "Markdown Topic 重构"
+  short_description: "将平铺的 Markdown Topic 重构为可展开的语义树"
+  default_prompt: "Use $markdown-topic-refactor to restructure an existing Markdown topic into a concise semantic hierarchy."

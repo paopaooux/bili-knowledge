@@ -59,6 +59,143 @@ def test_settings_never_returns_keys(settings):
     assert payload["stt_key_configured"] is True
 
 
+def test_browse_and_preview_knowledge_files_without_exposing_absolute_paths(settings):
+    topic = settings.knowledge_base_dir / "topics" / "学习方法.md"
+    topic.parent.mkdir(parents=True)
+    topic.write_text("# 学习方法\n\n间隔复习。", encoding="utf-8")
+    (settings.knowledge_base_dir / "audio.mp3").write_bytes(b"audio")
+    empty_job = settings.knowledge_base_dir / "失败任务" / "parts" / "P01"
+    empty_job.mkdir(parents=True)
+    outside = settings.knowledge_base_dir.parent / "secret.md"
+    outside.write_text("secret", encoding="utf-8")
+
+    app = create_app(settings, start_worker=False)
+    with TestClient(app) as client:
+        response = client.get("/api/knowledge/files")
+        preview = client.get("/api/knowledge/file", params={"path": "topics/学习方法.md"})
+        hidden_artifact = client.get("/api/knowledge/file", params={"path": "audio.mp3"})
+        traversal = client.get("/api/knowledge/file", params={"path": "../secret.md"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert str(settings.knowledge_base_dir) not in str(payload)
+    assert payload[0]["name"] == "开放知识库"
+    assert payload[0]["path"] == "@knowledge-base"
+    assert payload[0]["children"][0]["previewable"] is True
+    assert "audio.mp3" not in str(payload)
+    assert "失败任务" not in str(payload)
+    assert not empty_job.exists()
+    assert preview.text == "# 学习方法\n\n间隔复习。"
+    assert hidden_artifact.status_code == 404
+    assert traversal.status_code == 404
+
+
+def test_delete_failed_job_without_knowledge_output(settings):
+    app = create_app(settings, start_worker=False)
+    video = app.state.db.save_inspection(FAKE_INSPECTION)
+    job_id = app.state.db.create_job(video["id"], [video["parts"][0]["id"]])
+    app.state.db.execute("UPDATE jobs SET status='failed' WHERE id=?", (job_id,))
+    transcript = settings.knowledge_base_dir / "failed" / "transcript.json"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("[]", encoding="utf-8")
+    app.state.db.save_artifact(job_id, video["parts"][0]["id"], "transcript", transcript)
+    temp_dir = settings.temp_dir / job_id
+    temp_dir.mkdir(parents=True)
+    (temp_dir / "audio.mp3").write_bytes(b"audio")
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/jobs/{job_id}")
+        assert response.status_code == 204
+        assert client.get(f"/api/jobs/{job_id}").status_code == 404
+
+    assert not transcript.exists()
+    assert not temp_dir.exists()
+
+
+def test_delete_failed_job_only_removes_selected_job(settings):
+    app = create_app(settings, start_worker=False)
+    video = app.state.db.save_inspection(FAKE_INSPECTION)
+    job_ids = [
+        app.state.db.create_job(video["id"], [video["parts"][0]["id"]])
+        for _ in range(3)
+    ]
+    for job_id in job_ids:
+        app.state.db.execute("UPDATE jobs SET status='failed' WHERE id=?", (job_id,))
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/jobs/{job_ids[1]}")
+        remaining = {job["id"] for job in client.get("/api/jobs").json()}
+
+    assert response.status_code == 204
+    assert remaining == {job_ids[0], job_ids[2]}
+
+
+def test_delete_failed_job_rejects_existing_document(settings):
+    app = create_app(settings, start_worker=False)
+    video = app.state.db.save_inspection(FAKE_INSPECTION)
+    job_id = app.state.db.create_job(video["id"], [video["parts"][0]["id"]])
+    app.state.db.execute("UPDATE jobs SET status='failed' WHERE id=?", (job_id,))
+    document = settings.knowledge_base_dir / "failed" / "document.md"
+    document.parent.mkdir(parents=True)
+    document.write_text("# 已生成", encoding="utf-8")
+    app.state.db.save_artifact(job_id, video["parts"][0]["id"], "document", document)
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/jobs/{job_id}")
+
+    assert response.status_code == 409
+    assert "已经生成知识文档" in response.json()["detail"]
+    assert app.state.db.job_detail(job_id) is not None
+
+
+def test_completed_job_can_retry_only_organize_and_clears_old_topic_artifacts(settings):
+    app = create_app(settings, start_worker=False)
+    video = app.state.db.save_inspection(FAKE_INSPECTION)
+    part_id = video["parts"][0]["id"]
+    job_id = app.state.db.create_job(video["id"], [part_id])
+    app.state.db.execute(
+        "UPDATE job_stages SET status='completed' WHERE job_id=?",
+        (job_id,),
+    )
+    app.state.db.execute(
+        "UPDATE job_parts SET status='completed' WHERE job_id=?",
+        (job_id,),
+    )
+    app.state.db.execute(
+        "UPDATE jobs SET status='completed' WHERE id=?",
+        (job_id,),
+    )
+    document = settings.knowledge_base_dir / "completed" / "document.md"
+    topic = settings.knowledge_base_dir / "topics" / "学习方法.md"
+    document.parent.mkdir(parents=True)
+    topic.parent.mkdir(parents=True)
+    document.write_text("# 学习方法", encoding="utf-8")
+    topic.write_text("# 学习方法", encoding="utf-8")
+    app.state.db.save_artifact(job_id, part_id, "document", document)
+    app.state.db.save_artifact(job_id, part_id, "topic", topic)
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            f"/api/jobs/{job_id}/retry",
+            json={"part_id": part_id, "stage": "generate"},
+        )
+        response = client.post(
+            f"/api/jobs/{job_id}/retry",
+            json={"part_id": part_id, "stage": "organize"},
+        )
+
+    assert rejected.status_code == 409
+    assert response.status_code == 200
+    detail = app.state.db.job_detail(job_id)
+    assert detail["status"] == "queued"
+    stages = {item["stage"]: item["status"] for item in detail["parts"][0]["stages"]}
+    assert stages["generate"] == "completed"
+    assert stages["organize"] == "pending"
+    assert stages["publish"] == "pending"
+    assert not [item for item in detail["parts"][0]["artifacts"] if item["kind"] == "topic"]
+    assert topic.is_file()
+
+
 def test_create_job_rejects_existing_multipart_video(settings):
     app = create_app(settings, start_worker=False)
     video = app.state.db.save_inspection(

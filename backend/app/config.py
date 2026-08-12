@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -11,6 +10,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 @dataclass(slots=True)
 class Settings:
     data_dir: Path = ROOT_DIR / "data"
+    source_output_dir: Path = ROOT_DIR / "source-output"
     knowledge_base_dir: Path = ROOT_DIR / "knowledge-base"
     knowledge_profile_path: Path | None = None
     cookie_file: Path | None = None
@@ -41,6 +41,7 @@ class Settings:
 
     def public_dict(self) -> dict:
         return {
+            "source_output_dir": str(self.source_output_dir),
             "knowledge_base_dir": str(self.knowledge_base_dir),
             "knowledge_profile_path": (
                 str(self.knowledge_profile_path) if self.knowledge_profile_path else None
@@ -78,22 +79,22 @@ def _load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
-def load_settings(config_path: Path | None = None) -> Settings:
+def load_settings() -> Settings:
     _load_dotenv(ROOT_DIR / "config.env")
-    config_file = config_path or ROOT_DIR / "config.json"
-    raw: dict = {}
-    if config_file.exists():
-        raw = json.loads(config_file.read_text(encoding="utf-8"))
 
-    path_fields = {"data_dir", "knowledge_base_dir", "knowledge_profile_path", "cookie_file"}
+    path_fields = {
+        "data_dir", "source_output_dir", "knowledge_base_dir",
+        "knowledge_profile_path", "cookie_file",
+    }
     defaults = asdict(Settings())
     values = {
-        key: raw.get(key, value)
+        key: value
         for key, value in defaults.items()
         if key not in {"stt_api_key", "llm_api_key"}
     }
     env_map = {
         "data_dir": "DATA_DIR",
+        "source_output_dir": "SOURCE_OUTPUT_DIR",
         "knowledge_base_dir": "KNOWLEDGE_BASE_DIR",
         "knowledge_profile_path": "KNOWLEDGE_PROFILE_PATH",
         "cookie_file": "COOKIE_FILE",
@@ -105,6 +106,10 @@ def load_settings(config_path: Path | None = None) -> Settings:
         "oss_prefix": "OSS_PREFIX",
         "llm_base_url": "LLM_BASE_URL",
         "llm_model": "LLM_MODEL",
+        "audio_chunk_seconds": "AUDIO_CHUNK_SECONDS",
+        "transcript_chunk_chars": "TRANSCRIPT_CHUNK_CHARS",
+        "request_timeout_seconds": "REQUEST_TIMEOUT_SECONDS",
+        "stt_poll_timeout_seconds": "STT_POLL_TIMEOUT_SECONDS",
     }
     for key, env_name in env_map.items():
         if os.getenv(env_name):
@@ -115,6 +120,13 @@ def load_settings(config_path: Path | None = None) -> Settings:
             values[key] = path if path.is_absolute() else (ROOT_DIR / path).resolve()
         elif key in {"cookie_file", "knowledge_profile_path"}:
             values[key] = None
+    for key in (
+        "audio_chunk_seconds",
+        "transcript_chunk_chars",
+        "request_timeout_seconds",
+        "stt_poll_timeout_seconds",
+    ):
+        values[key] = int(values[key])
     values["stt_api_key"] = (
         os.getenv("DASHSCOPE_API_KEY")
         if values["stt_provider"].startswith("dashscope_")
@@ -126,5 +138,6 @@ def load_settings(config_path: Path | None = None) -> Settings:
     settings = Settings(**values)
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.temp_dir.mkdir(parents=True, exist_ok=True)
+    settings.source_output_dir.mkdir(parents=True, exist_ok=True)
     settings.knowledge_base_dir.mkdir(parents=True, exist_ok=True)
     return settings

@@ -12,5 +12,6 @@ frontend/vite.config.js
 frontend/vite.config.d.ts
 *.tsbuildinfo
 data/
+source-output/
 knowledge-base/
 *.sqlite3

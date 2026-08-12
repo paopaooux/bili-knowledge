@@ -111,6 +111,17 @@ MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS idx_profile_topics_profile
       ON knowledge_profile_topics(profile_id,sort_order);
     """,
+    """
+    ALTER TABLE artifacts RENAME TO artifacts_v5;
+    CREATE TABLE artifacts (
+      id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      part_id TEXT REFERENCES parts(id), kind TEXT NOT NULL, path TEXT NOT NULL,
+      created_at TEXT NOT NULL, UNIQUE(job_id, part_id, kind, path)
+    );
+    INSERT INTO artifacts(id,job_id,part_id,kind,path,created_at)
+    SELECT id,job_id,part_id,kind,path,created_at FROM artifacts_v5;
+    DROP TABLE artifacts_v5;
+    """,
 ]
 
 
@@ -241,10 +252,16 @@ class Database:
     def save_artifact(self, job_id: str, part_id: str | None, kind: str, path: Path) -> str:
         artifact_id = str(uuid.uuid4())
         with self.transaction() as connection:
-            existing = connection.execute(
-                "SELECT id FROM artifacts WHERE job_id=? AND part_id IS ? AND kind=?",
-                (job_id, part_id, kind),
-            ).fetchone()
+            if kind == "topic":
+                existing = connection.execute(
+                    "SELECT id FROM artifacts WHERE job_id=? AND part_id IS ? AND kind=? AND path=?",
+                    (job_id, part_id, kind, str(path)),
+                ).fetchone()
+            else:
+                existing = connection.execute(
+                    "SELECT id FROM artifacts WHERE job_id=? AND part_id IS ? AND kind=?",
+                    (job_id, part_id, kind),
+                ).fetchone()
             if existing:
                 connection.execute(
                     "UPDATE artifacts SET path=?,created_at=? WHERE id=?",

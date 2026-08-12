@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from app.constants import STAGES
 from app.database import Database
 
@@ -36,14 +38,34 @@ def test_migration_is_idempotent(settings):
     db = Database(settings.database_path)
     db.migrate()
     db.migrate()
-    assert db.one("SELECT COUNT(*) AS count FROM schema_migrations")["count"] == 5
+    assert db.one("SELECT COUNT(*) AS count FROM schema_migrations")["count"] == 6
+
+
+def test_part_can_persist_multiple_topic_artifacts(settings):
+    db = Database(settings.database_path)
+    db.migrate()
+    video = db.save_inspection(inspection())
+    part_id = video["parts"][0]["id"]
+    job_id = db.create_job(video["id"], [part_id])
+
+    first_id = db.save_artifact(job_id, part_id, "topic", Path("topics/时间管理.md"))
+    second_id = db.save_artifact(job_id, part_id, "topic", Path("topics/运动习惯.md"))
+    repeated_id = db.save_artifact(job_id, part_id, "topic", Path("topics/时间管理.md"))
+
+    artifacts = db.all(
+        "SELECT * FROM artifacts WHERE job_id=? AND part_id=? AND kind='topic' ORDER BY path",
+        (job_id, part_id),
+    )
+    assert len(artifacts) == 2
+    assert first_id != second_id
+    assert repeated_id == first_id
 
 
 def test_topic_state_keeps_only_latest_update(settings):
     db = Database(settings.database_path)
     db.migrate()
-    db.save_topic_state("文化/占星/星座.md", "BV1", "create", "2026-01-01T00:00:00+00:00")
-    db.save_topic_state("文化/占星/星座.md", "BV2", "merge", "2026-01-02T00:00:00+00:00")
+    db.save_topic_state("个人成长/学习方法.md", "BV1", "create", "2026-01-01T00:00:00+00:00")
+    db.save_topic_state("个人成长/学习方法.md", "BV2", "merge", "2026-01-02T00:00:00+00:00")
 
     rows = db.all("SELECT * FROM knowledge_topics")
     assert len(rows) == 1

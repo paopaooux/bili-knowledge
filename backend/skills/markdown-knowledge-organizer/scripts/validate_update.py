@@ -51,7 +51,10 @@ def _text_list(value: object, field: str, *, limit: int, item_limit: int) -> lis
     return result
 
 
-def validate_plan(value: object, existing_paths: set[str] | None = None) -> dict:
+def validate_plan(
+    value: object,
+    existing_paths: set[str] | None = None,
+) -> dict:
     if not isinstance(value, dict):
         raise PlanValidationError("更新计划必须是 JSON 对象")
     action = _text(value.get("action"), "action", limit=10).lower()
@@ -73,13 +76,6 @@ def validate_plan(value: object, existing_paths: set[str] | None = None) -> dict
     title = _text(value.get("title", ""), "title", required=action != "noop", limit=100)
     aliases = _text_list(value.get("aliases", []), "aliases", limit=10, item_limit=100)
     summary = _text(value.get("summary", ""), "summary", required=False, limit=500)
-    raw_related = value.get("related_paths", [])
-    if not isinstance(raw_related, list):
-        raise PlanValidationError("related_paths 必须是数组")
-    related = [validate_topic_path(item, "related_paths") for item in raw_related]
-    if len(related) > 5 or any(item not in known for item in related):
-        raise PlanValidationError("related_paths 只能包含最多 5 个已有主题")
-
     raw_sections = value.get("sections") or {}
     if not isinstance(raw_sections, dict):
         raise PlanValidationError("sections 必须是对象")
@@ -111,9 +107,6 @@ def validate_plan(value: object, existing_paths: set[str] | None = None) -> dict
     }
     if action != "noop" and not sections["knowledge"]:
         raise PlanValidationError("非 noop 计划至少需要一个核心知识点")
-    if action != "noop" and not sections["sources"]:
-        raise PlanValidationError("非 noop 计划至少需要一个来源")
-
     return {
         "action": action,
         "target_path": target_path,
@@ -121,8 +114,29 @@ def validate_plan(value: object, existing_paths: set[str] | None = None) -> dict
         "aliases": aliases,
         "summary": summary,
         "sections": sections,
-        "related_paths": list(dict.fromkeys(related)),
     }
+
+
+def validate_batch(value: object, existing_paths: set[str] | None = None) -> list[dict]:
+    if not isinstance(value, dict):
+        raise PlanValidationError("批量更新计划必须是 JSON 对象")
+    raw_updates = value.get("updates")
+    if not isinstance(raw_updates, list) or len(raw_updates) > 8:
+        raise PlanValidationError("updates 必须是最多 8 项的数组")
+    plans = [validate_plan(item, existing_paths) for item in raw_updates]
+    if any(plan["action"] == "noop" for plan in plans):
+        raise PlanValidationError("批量计划请用空 updates 表示 noop")
+    targets = [plan["target_path"] for plan in plans]
+    if len(targets) != len(set(targets)):
+        raise PlanValidationError("批量计划的 target_path 不能重复")
+    seen_knowledge: set[str] = set()
+    for plan in plans:
+        for knowledge in plan["sections"]["knowledge"]:
+            compact = "".join(knowledge.split()).casefold()
+            if compact in seen_knowledge:
+                raise PlanValidationError("同一知识点不能出现在多个主题更新中")
+            seen_knowledge.add(compact)
+    return plans
 
 
 def main() -> None:

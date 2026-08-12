@@ -74,3 +74,13 @@ export interface TopicSuggestion {
   path: string
   reason: string
 }
+
+export interface KnowledgeFile {
+  name: string
+  path: string
+  type: 'directory' | 'file'
+  size: number | null
+  modified_at: string
+  previewable: boolean
+  children?: KnowledgeFile[]
+}

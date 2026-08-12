@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import subprocess
 import time
 import uuid
@@ -15,6 +16,8 @@ from dashscope.audio.qwen_omni import MultiModality, OmniRealtimeCallback, OmniR
 from dashscope.audio.qwen_omni.omni_realtime import TranscriptionParams
 
 from .config import Settings
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class AIServiceError(RuntimeError):
@@ -351,6 +354,15 @@ def _transcribe_dashscope_filetrans(path: Path, settings: Settings) -> dict:
 
 def chat(messages: list[dict], settings: Settings, max_tokens: int = 3000) -> str:
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
+    input_chars = sum(len(str(message.get("content", ""))) for message in messages)
+    started = time.monotonic()
+    logger.info(
+        "LLM request started model=%s messages=%d input_chars=%d max_tokens=%d",
+        settings.llm_model,
+        len(messages),
+        input_chars,
+        max_tokens,
+    )
     try:
         with httpx.Client(timeout=settings.request_timeout_seconds) as client:
             response = client.post(
@@ -367,9 +379,21 @@ def chat(messages: list[dict], settings: Settings, max_tokens: int = 3000) -> st
             payload = response.json()
         content = payload["choices"][0]["message"]["content"].strip()
     except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
+        logger.warning(
+            "LLM request failed model=%s elapsed=%.2fs error_type=%s",
+            settings.llm_model,
+            time.monotonic() - started,
+            type(exc).__name__,
+        )
         raise AIServiceError(f"知识稿模型请求失败：{exc}") from exc
     if not content:
         raise AIServiceError("知识稿模型返回了空内容")
+    logger.info(
+        "LLM request completed model=%s output_chars=%d elapsed=%.2fs",
+        settings.llm_model,
+        len(content),
+        time.monotonic() - started,
+    )
     return content
 
 

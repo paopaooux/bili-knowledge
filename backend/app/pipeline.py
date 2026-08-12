@@ -17,10 +17,12 @@ from .config import Settings
 from .constants import STAGES
 from .database import Database, utcnow
 from .knowledge import organize_document
+from .prompting import render_prompt
 from .subtitles import normalize_segments, parse_subtitle
 from .utils import format_timestamp, safe_filename, timestamp_url
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
+PROMPTS_DIR = Path(__file__).resolve().parents[1] / "prompts"
 TIME_RANGE_PATTERN = re.compile(
     r"\[(?P<start>\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—]\s*"
     r"(?P<end>\d{1,2}:\d{2}(?::\d{2})?)\](?!\()"
@@ -51,9 +53,13 @@ class Pipeline:
             raise Cancelled("任务已取消")
 
     def _paths(self, job: dict, part: dict) -> dict[str, Path]:
-        root = self.settings.knowledge_base_dir / safe_filename(
-            f"{job['video_title']}-{job['bvid']}", 110
-        )
+        directory_name = safe_filename(f"{job['video_title']}-{job['bvid']}", 110)
+        root = self.settings.source_output_dir / directory_name
+        legacy_root = self.settings.knowledge_base_dir / directory_name
+        # Existing jobs created before source/knowledge storage was split keep using their
+        # original artifacts, so preview and organize-only retries continue to work.
+        if legacy_root.is_dir() and any(item.is_file() for item in legacy_root.rglob("*")):
+            root = legacy_root
         part_dir = root / "parts" / safe_filename(f"P{part['part_index']:02d}-{part['title']}", 100)
         temp = self.settings.temp_dir / job["id"] / part["id"]
         return {
@@ -63,7 +69,6 @@ class Pipeline:
             "metadata": part_dir / "metadata.json",
             "document": part_dir / "document.md",
             "knowledge_update": part_dir / "knowledge-update.json",
-            "index": root / "README.md",
             "temp": temp,
             "audio": temp / "audio.mp3",
         }
@@ -72,6 +77,7 @@ class Pipeline:
         job = self.db.job_detail(job_id)
         if not job:
             return
+        logger.info("Job started job_id=%s bvid=%s parts=%d", job_id, job["bvid"], len(job["parts"]))
         self.db.execute(
             "UPDATE jobs SET status='running',error=NULL,updated_at=? WHERE id=?",
             (utcnow(), job_id),
@@ -88,11 +94,11 @@ class Pipeline:
                     "UPDATE job_parts SET status='completed' WHERE job_id=? AND part_id=?",
                     (job_id, part["id"]),
                 )
-            self._publish_index(job_id)
             self.db.execute(
                 "UPDATE jobs SET status='completed',error=NULL,completed_at=?,updated_at=? WHERE id=?",
                 (utcnow(), utcnow(), job_id),
             )
+            logger.info("Job completed job_id=%s", job_id)
             shutil.rmtree(self.settings.temp_dir / job_id, ignore_errors=True)
         except Cancelled as exc:
             self.db.execute(
@@ -126,10 +132,23 @@ class Pipeline:
             if current and current["status"] in {"completed", "skipped"}:
                 continue
             self._cancel_guard(job["id"])
+            logger.info(
+                "Stage started job_id=%s part_id=%s stage=%s",
+                job["id"],
+                part["id"],
+                stage,
+            )
             self.db.set_stage(job["id"], part["id"], stage, "running")
             try:
                 status = handlers[stage]() or "completed"
                 self.db.set_stage(job["id"], part["id"], stage, status)
+                logger.info(
+                    "Stage finished job_id=%s part_id=%s stage=%s status=%s",
+                    job["id"],
+                    part["id"],
+                    stage,
+                    status,
+                )
             except Exception as exc:
                 self.db.set_stage(job["id"], part["id"], stage, "failed", str(exc))
                 self.db.execute(
@@ -232,21 +251,33 @@ class Pipeline:
             raise RuntimeError("缺少待转写音频；请从获取字幕/下载音频阶段重试")
         chunks = self._split_audio(paths["audio"], paths["temp"] / "chunks")
         segments = []
-        offset = 0.0
         detected_language = None
-        for chunk, duration in chunks:
+        previous_text = ""
+        for index, (chunk, start, duration) in enumerate(chunks, 1):
             self._cancel_guard(job["id"])
+            logger.info(
+                "Transcribing audio chunk job_id=%s part_id=%s chunk=%d/%d start=%.3fs duration=%.3fs",
+                job["id"],
+                part["id"],
+                index,
+                len(chunks),
+                start,
+                duration,
+            )
             payload = transcribe_audio(chunk, self.settings)
             detected_language = detected_language or payload.get("language")
+            raw_text = str(payload.get("text") or "").strip()
+            if self.settings.stt_provider == "dashscope_flash" and previous_text:
+                payload["text"] = self._trim_transcript_overlap(previous_text, raw_text)
             raw_segments = payload.get("segments") or [
                 {"start": 0, "end": duration, "text": payload.get("text", "")}
             ]
             normalized = normalize_segments(raw_segments, "stt")
             for segment in normalized:
-                segment["start"] = round(segment["start"] + offset, 3)
-                segment["end"] = round(segment["end"] + offset, 3)
+                segment["start"] = round(segment["start"] + start, 3)
+                segment["end"] = round(segment["end"] + start, 3)
             segments.extend(normalized)
-            offset += duration
+            previous_text = raw_text
         if not segments:
             raise RuntimeError("所有音频切片均未产生转写文本")
         _json_write(paths["transcript"], segments)
@@ -254,41 +285,89 @@ class Pipeline:
         self.db.save_artifact(job["id"], part["id"], "transcript", paths["transcript"])
         return "completed"
 
-    def _split_audio(self, audio: Path, output: Path) -> list[tuple[Path, float]]:
+    def _split_audio(self, audio: Path, output: Path) -> list[tuple[Path, float, float]]:
         output.mkdir(parents=True, exist_ok=True)
-        pattern = output / "chunk-%04d.mp3"
-        command = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(audio),
-            "-f",
-            "segment",
-            "-segment_time",
-            str(
-                min(self.settings.audio_chunk_seconds, 300)
-                if self.settings.stt_provider in {"dashscope_realtime", "dashscope_flash"}
-                else self.settings.audio_chunk_seconds
-            ),
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "96k",
-            str(pattern),
-        ]
-        try:
-            subprocess.run(command, check=True, capture_output=True, text=True)
-        except FileNotFoundError as exc:
-            raise RuntimeError("未找到 ffmpeg，请安装后再重试") from exc
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(f"音频切片失败：{exc.stderr[-500:]}") from exc
-        chunks = sorted(output.glob("chunk-*.mp3"))
-        if not chunks:
-            raise RuntimeError("ffmpeg 未生成音频切片")
-        return [(item, self._probe_duration(item)) for item in chunks]
+        total_duration = self._probe_duration(audio)
+        if total_duration <= 0:
+            raise RuntimeError("无法读取音频时长，不能安全切片")
+        limited_provider = self.settings.stt_provider in {"dashscope_realtime", "dashscope_flash"}
+        chunk_seconds = min(self.settings.audio_chunk_seconds, 240) if limited_provider else self.settings.audio_chunk_seconds
+        overlap = min(5.0, chunk_seconds / 10) if self.settings.stt_provider == "dashscope_flash" else 0.0
+        step = chunk_seconds - overlap
+        chunks = []
+        start = 0.0
+        index = 0
+        while start < total_duration - 0.01:
+            requested_duration = min(float(chunk_seconds), total_duration - start)
+            destination = output / f"chunk-{index:04d}.mp3"
+            command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(audio),
+                "-ss",
+                f"{start:.3f}",
+                "-t",
+                f"{requested_duration:.3f}",
+                "-vn",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "96k",
+                str(destination),
+            ]
+            try:
+                subprocess.run(command, check=True, capture_output=True, text=True)
+            except FileNotFoundError as exc:
+                raise RuntimeError("未找到 ffmpeg，请安装后再重试") from exc
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(f"音频切片失败：{exc.stderr[-500:]}") from exc
+            actual_duration = self._probe_duration(destination)
+            if actual_duration <= 0:
+                raise RuntimeError(f"音频切片 {index + 1} 没有有效时长")
+            chunks.append((destination, start, actual_duration))
+            if start + requested_duration >= total_duration - 0.01:
+                break
+            start += step
+            index += 1
+        logger.info(
+            "Audio split completed provider=%s total=%.3fs chunks=%d chunk_limit=%.1fs overlap=%.1fs",
+            self.settings.stt_provider,
+            total_duration,
+            len(chunks),
+            float(chunk_seconds),
+            overlap,
+        )
+        return chunks
+
+    @staticmethod
+    def _trim_transcript_overlap(previous: str, current: str) -> str:
+        def compact(value: str) -> tuple[str, list[int]]:
+            characters = []
+            positions = []
+            for position, character in enumerate(value):
+                if character.isalnum():
+                    characters.append(character.casefold())
+                    positions.append(position)
+            return "".join(characters), positions
+
+        previous_compact, _ = compact(previous)
+        current_compact, current_positions = compact(current)
+        maximum = min(160, len(previous_compact), len(current_compact))
+        for size in range(maximum, 3, -1):
+            if previous_compact[-size:] == current_compact[:size]:
+                cut = current_positions[size - 1] + 1
+                trimmed = current[cut:].lstrip(" ，。！？；：、,.!?;:\n\t")
+                logger.info(
+                    "Trimmed exact ASR chunk overlap matched_chars=%d removed_chars=%d",
+                    size,
+                    cut,
+                )
+                return trimmed
+        return current
 
     @staticmethod
     def _probe_duration(path: Path) -> float:
@@ -326,6 +405,13 @@ class Pipeline:
             size += len(line)
         if current:
             chunks.append("\n".join(current))
+        logger.info(
+            "Generating knowledge draft job_id=%s part_id=%s segments=%d chunks=%d",
+            job["id"],
+            part["id"],
+            len(segments),
+            len(chunks),
+        )
         notes = []
         for index, chunk in enumerate(chunks, 1):
             self._cancel_guard(job["id"])
@@ -334,38 +420,54 @@ class Pipeline:
                     [
                         {
                             "role": "system",
-                            "content": "你是严谨的知识编辑。只依据转写提炼；不得补充外部事实；不确定或听不清处明确标注。保留关键时间范围。",
+                            "content": render_prompt(PROMPTS_DIR / "transcript-chunk-system.md"),
                         },
                         {
                             "role": "user",
-                            "content": f"这是第 {index}/{len(chunks)} 段转写。提炼摘要、观点、概念和可引用依据：\n\n{chunk}",
+                            "content": render_prompt(
+                                PROMPTS_DIR / "transcript-chunk-user.md",
+                                index=index,
+                                total=len(chunks),
+                                chunk=chunk,
+                            ),
                         },
                     ],
                     self.settings,
                 )
             )
-        body = chat(
+        response = chat(
             [
                 {
                     "role": "system",
-                    "content": (
-                        "你是严谨的中文知识编辑。仅依据所给分段笔记撰写 Markdown。必须依次包含："
-                        "## 内容摘要、## 核心观点与结论、## 主题正文（可有三级标题）、## 术语与概念、## 依据引用。"
-                        "依据引用必须保留 [开始-结束] 时间范围。不确定内容明确标注，不得编造。不要输出 YAML，也不要输出完整转写。"
+                    "content": render_prompt(PROMPTS_DIR / "knowledge-draft-system.md"),
+                },
+                {
+                    "role": "user",
+                    "content": render_prompt(
+                        PROMPTS_DIR / "knowledge-draft-user.md",
+                        notes="\n\n---\n\n".join(notes),
                     ),
                 },
-                {"role": "user", "content": "合并以下分段笔记：\n\n" + "\n\n---\n\n".join(notes)},
             ],
             self.settings,
             max_tokens=5000,
         )
+        title, body = self._parse_knowledge_draft(response, metadata=_json_read(paths["metadata"]))
         body = self._link_evidence_timestamps(body, part["url"])
         metadata = _json_read(paths["metadata"])
         metadata["generated_at"] = utcnow()
         metadata["model"] = self.settings.llm_model
         _json_write(paths["metadata"], metadata)
-        markdown = self._render_document(metadata, body, segments)
+        markdown = self._render_document(title, body)
         paths["document"].write_text(markdown, encoding="utf-8")
+        logger.info(
+            "Knowledge document written job_id=%s part_id=%s title=%r chars=%d path=%s",
+            job["id"],
+            part["id"],
+            title,
+            len(markdown),
+            paths["document"],
+        )
         self.db.save_artifact(job["id"], part["id"], "document", paths["document"])
         summary = notes[0][:500] if notes else ""
         self.db.execute(
@@ -386,32 +488,31 @@ class Pipeline:
 
         return TIME_RANGE_PATTERN.sub(replacement, body)
 
-    def _render_document(self, metadata: dict, body: str, segments: list[dict]) -> str:
-        yaml_lines = ["---"]
-        fields = [
-            "title",
-            "video_title",
-            "bvid",
-            "part",
-            "source_url",
-            "uploader",
-            "published_at",
-            "duration",
-            "language",
-            "subtitle_source",
-            "generated_at",
-            "model",
-        ]
-        for key in fields:
-            yaml_lines.append(f"{key}: {json.dumps(metadata.get(key), ensure_ascii=False)}")
-        yaml_lines.extend(["---", "", f"# {metadata['title']}", ""])
-        transcript = ["## 完整带时间戳转写", ""]
-        for segment in segments:
-            label = f"{format_timestamp(segment['start'])}–{format_timestamp(segment['end'])}"
-            transcript.append(
-                f"- [{label}]({timestamp_url(metadata['source_url'], segment['start'])}) {segment['text']}"
-            )
-        return "\n".join(yaml_lines) + body.strip() + "\n\n" + "\n".join(transcript) + "\n"
+    @staticmethod
+    def _parse_knowledge_draft(response: str, metadata: dict) -> tuple[str, str]:
+        text = response.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+        start, end = text.find("{"), text.rfind("}")
+        try:
+            payload = json.loads(text[start : end + 1])
+            title = str(payload["title"]).strip()
+            body = str(payload["body"]).strip()
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("知识稿模型没有返回有效的 title/body JSON") from exc
+        if not title or "\n" in title or len(title) > 100:
+            raise RuntimeError("知识稿标题为空、过长或包含换行")
+        video_titles = {str(metadata.get("title") or "").strip(), str(metadata.get("video_title") or "").strip()}
+        if title in video_titles:
+            raise RuntimeError("知识稿模型照抄了视频标题，没有生成知识主题标题")
+        if not body:
+            raise RuntimeError("知识稿正文为空")
+        body = re.sub(r"^#\s+[^\n]+\n+", "", body).strip()
+        return title, body
+
+    @staticmethod
+    def _render_document(title: str, body: str) -> str:
+        return f"# {title}\n\n{body.strip()}\n"
 
     def _publish(self, job: dict, part: dict, paths: dict[str, Path]) -> str:
         if not paths["document"].exists():
@@ -427,44 +528,28 @@ class Pipeline:
             self.settings,
             profile=self.db.active_knowledge_profile(),
         )
+        logger.info(
+            "Knowledge organized job_id=%s part_id=%s updates=%d targets=%s",
+            job["id"],
+            part["id"],
+            len(result["updates"]),
+            [update["plan"]["target_path"] for update in result["updates"]],
+        )
         _json_write(paths["knowledge_update"], result)
         self.db.save_artifact(job["id"], part["id"], "knowledge_update", paths["knowledge_update"])
-        if result.get("topic_path"):
-            topic_path = Path(result["topic_path"])
+        for update in result["updates"]:
+            topic_path = Path(update["topic_path"])
             relative_path = topic_path.relative_to(
                 self.settings.knowledge_base_dir / "topics"
             ).as_posix()
             self.db.save_topic_state(
                 relative_path,
                 job.get("bvid"),
-                result["plan"]["action"],
-                result["updated_at"],
+                update["plan"]["action"],
+                update["updated_at"],
             )
             self.db.save_artifact(job["id"], part["id"], "topic", topic_path)
         return "completed"
-
-    def _publish_index(self, job_id: str) -> None:
-        job = self.db.job_detail(job_id)
-        if not job:
-            return
-        first_paths = self._paths(job, job["parts"][0])
-        lines = [
-            f"# {job['video_title']}",
-            "",
-            f"- BV 号：{job['bvid']}",
-            f"- 来源：[{job['video_url']}]({job['video_url']})",
-            "",
-            "## 知识文档",
-            "",
-        ]
-        for part in job["parts"]:
-            paths = self._paths(job, part)
-            relative = paths["document"].relative_to(first_paths["root"]).as_posix()
-            summary = (part.get("summary") or "").replace("\n", " ")[:160]
-            lines.append(f"- [{part['title']}]({relative}) — {part['status']} {summary}")
-        first_paths["index"].parent.mkdir(parents=True, exist_ok=True)
-        first_paths["index"].write_text("\n".join(lines) + "\n", encoding="utf-8")
-        self.db.save_artifact(job_id, None, "index", first_paths["index"])
 
     @staticmethod
     def _update_metadata(paths: dict[str, Path], **values: object) -> None:
