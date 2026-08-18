@@ -1,0 +1,24 @@
+services:
+  bili-knowledge:
+    build:
+      context: .
+    image: bili-knowledge:local
+    container_name: bili-knowledge
+    hostname: bili-knowledge
+    restart: unless-stopped
+    env_file:
+      - config.env
+    environment:
+      DATA_DIR: /app/data
+      SOURCE_OUTPUT_DIR: /app/source-output
+      KNOWLEDGE_BASE_DIR: /app/knowledge-base
+      KNOWLEDGE_PROFILE_PATH: /app/profiles/open.json
+      BACKEND_HOST: 127.0.0.1
+      BACKEND_PORT: 8000
+    ports:
+      - "127.0.0.1:5175:8080"
+    volumes:
+      - ./data:/app/data
+      - ./source-output:/app/source-output
+      - ./knowledge-base:/app/knowledge-base
+    init: true

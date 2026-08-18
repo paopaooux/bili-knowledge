@@ -106,4 +106,4 @@ if old_root and old_root != new_root:
 PY
 
 echo "数据恢复完成。原数据可从这里恢复：${ROLLBACK_DIR}"
-echo "config.env 未被修改；确认配置后可启动 ./start.sh"
+echo "config.env 未被修改；确认配置后可启动 ./scripts/start.sh"

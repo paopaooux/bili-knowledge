@@ -70,36 +70,7 @@ Profile 用来告诉系统“希望从视频里保留什么知识”。默认 Pr
 
 ## 快速启动
 
-### 环境要求
-
-- Python 3.12 或更高版本
-- Node.js 20 或更高版本
-- FFmpeg（没有公开字幕的视频需要）
-
-确认环境：
-
-```bash
-python3 --version
-node --version
-ffmpeg -version
-ffprobe -version
-```
-
-### 安装依赖
-
-在项目根目录执行：
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e './backend[dev]'
-
-cd frontend
-npm install
-cd ..
-```
-
-### 配置模型
+### 公共配置
 
 复制环境变量示例并编辑项目根目录的 `config.env`：
 
@@ -127,13 +98,71 @@ LLM_ENABLE_THINKING=false
 
 请不要把包含真实 API Key 的 `config.env` 提交到公开仓库。
 
-### 启动服务
+两种运行方式共用这一个 `config.env`：本机运行时由后端直接读取，Docker 运行时由 Compose 注入为容器环境变量。两种方式都会使用项目根目录的 `data/`、`source-output/` 和 `knowledge-base/`。
+
+### 一键启动（推荐）
+
+在项目根目录统一运行：
 
 ```bash
-./start.sh
+./scripts/start.sh
 ```
 
-然后访问 <http://127.0.0.1:5175>。在启动终端按 `Ctrl+C` 会同时停止前后端。
+脚本会自动选择运行方式：检测到可用 Docker 时使用 Docker Compose；没有安装 Docker 时使用本机 FastAPI + Vite。Docker 容器已经运行时，再次执行脚本只会显示当前地址并退出，不会重复启动第二套服务。
+
+如果系统安装了 Docker 命令但 Docker 服务没有启动，脚本会明确报错，不会自动改成本机运行。需要手动指定时可以使用：
+
+```bash
+./scripts/start.sh --docker
+./scripts/start.sh --local
+```
+
+### Docker 方式（服务器推荐）
+
+只需要安装 Docker 和 Docker Compose，不需要在宿主机安装 Python、Node.js 或 FFmpeg：
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+访问 <http://127.0.0.1:5175>。查看日志和停止服务：
+
+```bash
+docker compose logs -f
+docker compose down
+```
+
+修改 `config.env` 后运行 `docker compose up -d --force-recreate`；更新代码或依赖后运行 `docker compose up -d --build`。镜像只包含服务所需的后端、编译后的前端和运行依赖，不包含 Android 工程或 Codex。
+
+### 本机方式（开发调试）
+
+本机需要：
+
+- Python 3.12 或更高版本；
+- Node.js 20 或更高版本；
+- FFmpeg（没有公开字幕的视频需要）。
+
+首次使用先安装依赖：
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e './backend[dev]'
+
+cd frontend
+npm install
+cd ..
+```
+
+没有安装 Docker 时直接运行统一入口；如果机器已经安装 Docker，则使用 `--local`：
+
+```bash
+./scripts/start.sh
+./scripts/start.sh --local
+```
+
+脚本会启动 FastAPI 后端和 Vite 开发服务器。访问 <http://127.0.0.1:5175>；在启动终端按 `Ctrl+C` 会同时停止前后端。
 
 ## 输出文件在哪里
 
@@ -157,6 +186,16 @@ knowledge-base/
 视频元数据保存在 `metadata.json`，完整转写保存在 `transcript.json`，不会混入知识正文。来源知识稿不会被知识整理器覆盖。同一条视频包含多个独立知识主题时，系统会分别新建或合并到 `topics/` 下不同的 `.md` 文件，而不是按视频生成单一归档文件。
 
 主题更新时间直接使用文件修改时间。SQLite 只保存主题最后一次更新的来源、动作和时间，不额外生成历史副本；需要版本历史时建议对 `knowledge-base/` 使用 Git。
+
+## 运行日志
+
+任务阶段、模型调用、重试和异常日志会写入 `data/logs/backend.log`，Docker 和本机启动方式使用同一目录。日志文件达到 10 MiB 后自动轮转，最多保留 5 个历史文件。
+
+HTTP 访问日志不写入日志文件；Docker 健康检查产生的 `/api/health` 访问日志也不会输出到控制台。需要实时查看容器日志时运行：
+
+```bash
+docker compose logs -f
+```
 
 ## 数据备份与迁移
 
@@ -242,12 +281,12 @@ cd android
 
 ### 浏览器里看不到最新界面怎么办？
 
-先按 `Ctrl+Shift+R` 强制刷新。如果修改了后端代码，需要重新运行 `./start.sh`；如果访问的是部署地址，还需要重新部署最新的前端构建产物。
+先按 `Ctrl+Shift+R` 强制刷新。本机开发方式需要重新运行 `./scripts/start.sh --local`；Docker 方式在代码更新后需要运行 `docker compose up -d --build`。
 
 ## 部署提醒
 
 - SQLite 数据库、`source-output/` 和 `knowledge-base/` 必须放在持久化磁盘中，否则容器重建后会丢失任务与知识文档。
-- 当前项目默认监听本机地址，适合个人使用。
+- 两种启动方式默认都只监听本机地址，适合个人使用。
 - Profile 管理接口目前没有登录鉴权。部署到公网前，请通过反向代理、访问控制或后续鉴权功能限制管理入口。
 - 请妥善保护 `config.env` 和视频 Cookie 文件。
 

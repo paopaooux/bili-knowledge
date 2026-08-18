@@ -23,6 +23,7 @@ from .knowledge_profile import (
     normalize_knowledge_profile,
     validate_topic_path,
 )
+from .logging_config import configure_runtime_logging
 from .pipeline import JobWorker, Pipeline
 from .prompting import render_prompt
 from .schemas import (
@@ -42,6 +43,7 @@ PROMPTS_DIR = Path(__file__).resolve().parents[1] / "prompts"
 
 def create_app(settings: Settings | None = None, start_worker: bool = True) -> FastAPI:
     config = settings or load_settings()
+    configure_runtime_logging(config)
     db = Database(config.database_path)
     db.migrate()
     db.seed_knowledge_profile(load_knowledge_profile(config.knowledge_profile_path))

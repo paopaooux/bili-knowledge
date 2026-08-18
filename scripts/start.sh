@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PROJECT_DIR}/.venv/bin/python"
+START_MODE="${1:-auto}"
 BACKEND_PORT=8000
 FRONTEND_PORT=5175
 BACKEND_PID=""
@@ -12,6 +13,30 @@ die() {
   echo "错误：$*" >&2
   exit 1
 }
+
+usage() {
+  cat <<'EOF'
+用法：./scripts/start.sh [--docker|--local]
+
+不带参数时自动选择：检测到可用 Docker 就启动 Compose，否则在本机启动。
+  --docker  强制使用 Docker Compose
+  --local   强制在本机启动 FastAPI 和 Vite
+EOF
+}
+
+case "${START_MODE}" in
+  auto) ;;
+  --docker) START_MODE="docker" ;;
+  --local) START_MODE="local" ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
 
 port_is_free() {
   "${PYTHON_BIN}" -c '
@@ -40,6 +65,42 @@ cleanup() {
   echo "前后端已关闭。"
   exit "${exit_code}"
 }
+
+start_docker() {
+  command -v docker >/dev/null 2>&1 || die "未找到 Docker；请安装 Docker 或使用 --local"
+  docker compose version >/dev/null 2>&1 || die "未找到 Docker Compose 插件"
+  docker info >/dev/null 2>&1 || \
+    die "检测到 Docker 命令，但无法连接 Docker 服务；请先启动 Docker"
+
+  local container_id
+  container_id="$({
+    cd "${PROJECT_DIR}"
+    docker compose ps --status running -q bili-knowledge
+  })"
+  if [[ -n "${container_id}" ]]; then
+    echo "拾影成文 Docker 服务已在运行，本次不重复启动。"
+    echo "  Web 页面： http://127.0.0.1:${FRONTEND_PORT}"
+    echo "  查看状态： docker compose ps"
+    exit 0
+  fi
+
+  echo "正在使用 Docker Compose 启动拾影成文……"
+  (
+    cd "${PROJECT_DIR}"
+    docker compose up -d --build
+  )
+  echo
+  echo "拾影成文 Docker 服务已启动："
+  echo "  Web 页面： http://127.0.0.1:${FRONTEND_PORT}"
+  echo "  查看日志： docker compose logs -f"
+  echo "  停止服务： docker compose down"
+}
+
+if [[ "${START_MODE}" == "docker" ]] || \
+  { [[ "${START_MODE}" == "auto" ]] && command -v docker >/dev/null 2>&1; }; then
+  start_docker
+  exit 0
+fi
 
 [[ -x "${PYTHON_BIN}" ]] || die "未找到虚拟环境，请先运行 python3.12 -m venv .venv"
 "${PYTHON_BIN}" -c 'import dashscope, fastapi, oss2, uvicorn, yt_dlp' 2>/dev/null || \
