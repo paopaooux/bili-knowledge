@@ -8,6 +8,7 @@ import yt_dlp
 from .config import Settings
 
 BVID_PATTERN = re.compile(r"BV[0-9A-Za-z]{10}", re.IGNORECASE)
+SHORT_LINK_HOSTS = {"b23.tv", "www.b23.tv"}
 
 
 class VideoInspectionError(RuntimeError):
@@ -57,12 +58,26 @@ def _cover_url(info: dict) -> str | None:
     return None
 
 
+def _resolved_bvid(info: dict, entries: list[dict]) -> str | None:
+    candidates = [
+        info.get("id"),
+        info.get("webpage_url"),
+        info.get("original_url"),
+        *(entry.get("id") for entry in entries if entry),
+        *(entry.get("webpage_url") for entry in entries if entry),
+    ]
+    for candidate in candidates:
+        match = BVID_PATTERN.search(str(candidate or ""))
+        if match:
+            return "BV" + match.group(0)[2:]
+    return None
+
+
 def inspect_video(url: str, settings: Settings) -> dict:
     match = BVID_PATTERN.search(url)
-    if not match:
-        raise VideoInspectionError("仅支持包含普通 BV 号的 Bilibili 视频链接")
-    # BV 编码主体大小写敏感；只规范化固定前缀。
-    bvid = "BV" + match.group(0)[2:]
+    hostname = (urlparse(url).hostname or "").lower().rstrip(".")
+    if not match and hostname not in SHORT_LINK_HOSTS:
+        raise VideoInspectionError("仅支持含 BV 号的 Bilibili 视频链接或 b23.tv 官方短链")
     options = {
         "quiet": True,
         "no_warnings": True,
@@ -84,6 +99,12 @@ def inspect_video(url: str, settings: Settings) -> dict:
         raise VideoInspectionError("视频解析没有返回信息")
 
     entries = list(info.get("entries") or [])
+    # BV 编码主体大小写敏感；只规范化固定前缀。短链必须在解析后的
+    # Bilibili 页面信息中得到 BV 号，不能信任任意重定向目标。
+    bvid = "BV" + match.group(0)[2:] if match else _resolved_bvid(info, entries)
+    if not bvid:
+        raise VideoInspectionError("b23.tv 短链没有解析到有效的 Bilibili BV 视频")
+    canonical_url = f"https://www.bilibili.com/video/{bvid}"
     if len(entries) > 1:
         raise VideoInspectionError("当前版本暂不支持分 P 视频，请使用单 P 视频链接")
     if not entries:
@@ -98,7 +119,7 @@ def inspect_video(url: str, settings: Settings) -> dict:
                 "index": part_index,
                 "cid": str(entry.get("cid") or entry.get("id") or ""),
                 "title": entry.get("title") or entry.get("part") or f"P{part_index}",
-                "url": _part_url(url, part_index),
+                "url": _part_url(canonical_url, part_index),
                 "duration": entry.get("duration") or info.get("duration"),
                 "subtitles": _subtitle_items(entry),
                 "raw": {"webpage_url": entry.get("webpage_url"), "id": entry.get("id")},
@@ -114,7 +135,7 @@ def inspect_video(url: str, settings: Settings) -> dict:
         )
     return {
         "bvid": bvid,
-        "url": f"https://www.bilibili.com/video/{bvid}",
+        "url": canonical_url,
         "title": info.get("title") or bvid,
         "uploader": info.get("uploader") or info.get("channel"),
         "cover_url": _cover_url(info),

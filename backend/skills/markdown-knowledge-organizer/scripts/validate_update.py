@@ -58,8 +58,8 @@ def validate_plan(
     if not isinstance(value, dict):
         raise PlanValidationError("更新计划必须是 JSON 对象")
     action = _text(value.get("action"), "action", limit=10).lower()
-    if action not in {"create", "merge", "link", "noop"}:
-        raise PlanValidationError("action 只能是 create、merge、link 或 noop")
+    if action not in {"create", "merge", "noop"}:
+        raise PlanValidationError("action 只能是 create、merge 或 noop")
 
     target_path = ""
     if action != "noop":
@@ -70,10 +70,13 @@ def validate_plan(
     known = existing_paths or set()
     if action == "merge" and target_path not in known:
         raise PlanValidationError("merge 的 target_path 必须是已有主题")
-    if action in {"create", "link"} and target_path in known:
+    if action == "create" and target_path in known:
         raise PlanValidationError(f"{action} 的 target_path 必须是新主题")
 
-    title = _text(value.get("title", ""), "title", required=action != "noop", limit=100)
+    raw_title = str(value.get("title") or "").strip()
+    if action != "noop" and not raw_title and target_path:
+        raw_title = PurePosixPath(target_path).stem
+    title = _text(raw_title, "title", required=action != "noop", limit=100)
     aliases = _text_list(value.get("aliases", []), "aliases", limit=10, item_limit=100)
     summary = _text(value.get("summary", ""), "summary", required=False, limit=500)
     raw_sections = value.get("sections") or {}
@@ -83,7 +86,7 @@ def validate_plan(
         "overview": _text(
             raw_sections.get("overview", ""),
             "sections.overview",
-            required=action != "noop",
+            required=action == "create",
             limit=4000,
         ),
         "knowledge": _text_list(
@@ -121,8 +124,8 @@ def validate_batch(value: object, existing_paths: set[str] | None = None) -> lis
     if not isinstance(value, dict):
         raise PlanValidationError("批量更新计划必须是 JSON 对象")
     raw_updates = value.get("updates")
-    if not isinstance(raw_updates, list) or len(raw_updates) > 8:
-        raise PlanValidationError("updates 必须是最多 8 项的数组")
+    if not isinstance(raw_updates, list):
+        raise PlanValidationError("updates 必须是数组")
     plans = [validate_plan(item, existing_paths) for item in raw_updates]
     if any(plan["action"] == "noop" for plan in plans):
         raise PlanValidationError("批量计划请用空 updates 表示 noop")

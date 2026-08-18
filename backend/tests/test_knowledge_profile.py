@@ -5,6 +5,7 @@ import pytest
 from app.knowledge_profile import (
     KnowledgeProfileError,
     load_knowledge_profile,
+    profile_instructions,
     validate_profile_plan,
 )
 
@@ -39,7 +40,10 @@ def test_loads_guided_profile(tmp_path):
     profile = load_knowledge_profile(path)
     assert profile["name"] == "个人成长与学习"
     assert profile["preferred_topics"][0]["path"] == "个人成长/学习方法.md"
-    assert profile["rules"] == {"ignore_out_of_scope": True, "merge_similar": True}
+    assert profile["rules"] == {"ignore_out_of_scope": False, "merge_similar": True}
+    instructions = profile_instructions(profile)
+    assert "scope 和推荐主题只是归类优先级，不是内容过滤器" in instructions
+    assert "即使 scope 中包含“忽略”或“排除”" in instructions
 
 
 def test_strict_profile_rejects_unconfigured_target():

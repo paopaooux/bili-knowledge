@@ -46,6 +46,13 @@ def test_inspect_create_list_and_cancel(monkeypatch, settings):
         topic_path.write_text("# 主题知识", encoding="utf-8")
         topic_id = app.state.db.save_artifact(job["id"], job["parts"][0]["id"], "topic", topic_path)
         assert client.get(f"/api/documents/{topic_id}").text == "# 主题知识"
+        update_path = settings.knowledge_base_dir / "test" / "knowledge-update.json"
+        update_path.parent.mkdir(parents=True, exist_ok=True)
+        update_path.write_text('{"plans":[]}', encoding="utf-8")
+        update_id = app.state.db.save_artifact(
+            job["id"], job["parts"][0]["id"], "knowledge_update", update_path
+        )
+        assert client.get(f"/api/documents/{update_id}").text == '{"plans":[]}'
         assert client.post(f"/api/jobs/{job['id']}/cancel").status_code == 200
 
 
@@ -110,6 +117,19 @@ def test_delete_failed_job_without_knowledge_output(settings):
 
     assert not transcript.exists()
     assert not temp_dir.exists()
+
+
+def test_delete_cancelled_job_without_knowledge_output(settings):
+    app = create_app(settings, start_worker=False)
+    video = app.state.db.save_inspection(FAKE_INSPECTION)
+    job_id = app.state.db.create_job(video["id"], [video["parts"][0]["id"]])
+    app.state.db.execute("UPDATE jobs SET status='cancelled' WHERE id=?", (job_id,))
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/jobs/{job_id}")
+
+    assert response.status_code == 204
+    assert app.state.db.job_detail(job_id) is None
 
 
 def test_delete_failed_job_only_removes_selected_job(settings):
@@ -196,6 +216,70 @@ def test_completed_job_can_retry_only_organize_and_clears_old_topic_artifacts(se
     assert topic.is_file()
 
 
+def test_regenerate_knowledge_clears_outputs_and_queues_from_generate(settings):
+    app = create_app(settings, start_worker=False)
+    video = app.state.db.save_inspection(FAKE_INSPECTION)
+    part_id = video["parts"][0]["id"]
+    job_id = app.state.db.create_job(video["id"], [part_id])
+    app.state.db.execute("UPDATE job_stages SET status='completed' WHERE job_id=?", (job_id,))
+    app.state.db.execute("UPDATE job_parts SET status='completed' WHERE job_id=?", (job_id,))
+    app.state.db.execute("UPDATE jobs SET status='completed' WHERE id=?", (job_id,))
+
+    job = app.state.db.job_detail(job_id)
+    paths = app.state.worker.pipeline._paths(job, job["parts"][0])
+    paths["part"].mkdir(parents=True)
+    paths["transcript"].write_text(
+        '[{"start":0,"end":1,"text":"保留的转写","source":"subtitle"}]', encoding="utf-8"
+    )
+    paths["metadata"].write_text('{"title":"P1","video_title":"API 测试"}', encoding="utf-8")
+    paths["document"].write_text("# 旧知识正文", encoding="utf-8")
+    paths["knowledge_update"].write_text("{}", encoding="utf-8")
+    topic = settings.knowledge_base_dir / "topics" / "旧主题.md"
+    topic.parent.mkdir(parents=True)
+    topic.write_text("# 旧主题", encoding="utf-8")
+    for kind, path in (
+        ("transcript", paths["transcript"]), ("metadata", paths["metadata"]),
+        ("document", paths["document"]), ("knowledge_update", paths["knowledge_update"]),
+        ("topic", topic),
+    ):
+        app.state.db.save_artifact(job_id, part_id, kind, path)
+    app.state.db.save_topic_state("旧主题.md", video["bvid"], "create", "2026-01-01")
+
+    with TestClient(app) as client:
+        response = client.post("/api/knowledge/regenerate")
+
+    assert response.status_code == 200
+    assert response.json() == {"queued_jobs": 1, "queued_parts": 1}
+    assert paths["transcript"].is_file()
+    assert paths["metadata"].is_file()
+    assert not paths["document"].exists()
+    assert not paths["knowledge_update"].exists()
+    assert not topic.exists()
+    assert app.state.db.all("SELECT * FROM knowledge_topics") == []
+    detail = app.state.db.job_detail(job_id)
+    assert detail["status"] == "queued"
+    stages = {stage["stage"]: stage["status"] for stage in detail["parts"][0]["stages"]}
+    assert stages == {
+        "parse": "completed", "acquire": "completed", "transcribe": "completed",
+        "generate": "pending", "organize": "pending", "publish": "pending",
+    }
+    assert {artifact["kind"] for artifact in detail["parts"][0]["artifacts"]} == {
+        "transcript", "metadata"
+    }
+
+
+def test_regenerate_knowledge_rejects_while_queue_is_active(settings):
+    app = create_app(settings, start_worker=False)
+    video = app.state.db.save_inspection(FAKE_INSPECTION)
+    app.state.db.create_job(video["id"], [video["parts"][0]["id"]])
+
+    with TestClient(app) as client:
+        response = client.post("/api/knowledge/regenerate")
+
+    assert response.status_code == 409
+    assert "仍有任务" in response.json()["detail"]
+
+
 def test_create_job_rejects_existing_multipart_video(settings):
     app = create_app(settings, start_worker=False)
     video = app.state.db.save_inspection(
@@ -218,6 +302,33 @@ def test_create_job_rejects_existing_multipart_video(settings):
 
     assert response.status_code == 422
     assert "仅支持单 P" in response.json()["detail"]
+
+
+def test_create_job_deduplicates_same_bvid_and_part_across_inspections(settings):
+    app = create_app(settings, start_worker=False)
+    first_video = app.state.db.save_inspection(FAKE_INSPECTION)
+    second_video = app.state.db.save_inspection(FAKE_INSPECTION)
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/jobs",
+            json={
+                "video_id": first_video["id"],
+                "part_ids": [first_video["parts"][0]["id"]],
+            },
+        )
+        duplicate = client.post(
+            "/api/jobs",
+            json={
+                "video_id": second_video["id"],
+                "part_ids": [second_video["parts"][0]["id"]],
+            },
+        )
+
+    assert created.status_code == 201
+    assert duplicate.status_code == 409
+    assert "相同视频任务已存在" in duplicate.json()["detail"]
+    assert app.state.db.one("SELECT COUNT(*) AS count FROM jobs")["count"] == 1
 
 
 def test_profile_crud_generates_paths_and_activates(settings):

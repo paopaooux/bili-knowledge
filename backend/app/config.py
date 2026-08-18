@@ -14,22 +14,25 @@ class Settings:
     knowledge_base_dir: Path = ROOT_DIR / "knowledge-base"
     knowledge_profile_path: Path | None = None
     cookie_file: Path | None = None
-    stt_provider: str = "openai_compatible"
-    stt_base_url: str = "https://api.openai.com/v1"
-    stt_model: str = "whisper-1"
+    stt_provider: str = "dashscope_flash"
+    stt_base_url: str = ""
+    stt_model: str = ""
     stt_api_key: str | None = None
     oss_endpoint: str | None = None
     oss_bucket: str | None = None
     oss_access_key_id: str | None = None
     oss_access_key_secret: str | None = None
     oss_prefix: str = "bili-knowledge-stt"
-    llm_base_url: str = "https://api.openai.com/v1"
-    llm_model: str = "gpt-4o-mini"
+    llm_base_url: str = ""
+    llm_model: str = ""
     llm_api_key: str | None = None
+    llm_enable_thinking: bool | None = None
     audio_chunk_seconds: int = 900
-    transcript_chunk_chars: int = 12_000
-    request_timeout_seconds: int = 120
+    knowledge_draft_max_tokens: int = 10_000
+    request_timeout_seconds: int = 1_200
     stt_poll_timeout_seconds: int = 7200
+    auto_refactor_topics: bool = True
+    job_worker_concurrency: int = 8
 
     @property
     def database_path(self) -> Path:
@@ -65,6 +68,7 @@ class Settings:
             "llm_base_url": self.llm_base_url,
             "llm_model": self.llm_model,
             "llm_key_configured": bool(self.llm_api_key),
+            "llm_enable_thinking": self.llm_enable_thinking,
         }
 
 
@@ -107,9 +111,10 @@ def load_settings() -> Settings:
         "llm_base_url": "LLM_BASE_URL",
         "llm_model": "LLM_MODEL",
         "audio_chunk_seconds": "AUDIO_CHUNK_SECONDS",
-        "transcript_chunk_chars": "TRANSCRIPT_CHUNK_CHARS",
+        "knowledge_draft_max_tokens": "KNOWLEDGE_DRAFT_MAX_TOKENS",
         "request_timeout_seconds": "REQUEST_TIMEOUT_SECONDS",
         "stt_poll_timeout_seconds": "STT_POLL_TIMEOUT_SECONDS",
+        "job_worker_concurrency": "JOB_WORKER_CONCURRENCY",
     }
     for key, env_name in env_map.items():
         if os.getenv(env_name):
@@ -122,17 +127,39 @@ def load_settings() -> Settings:
             values[key] = None
     for key in (
         "audio_chunk_seconds",
-        "transcript_chunk_chars",
+        "knowledge_draft_max_tokens",
         "request_timeout_seconds",
         "stt_poll_timeout_seconds",
+        "job_worker_concurrency",
     ):
         values[key] = int(values[key])
-    values["stt_api_key"] = (
-        os.getenv("DASHSCOPE_API_KEY")
-        if values["stt_provider"].startswith("dashscope_")
-        else os.getenv("STT_API_KEY")
+    values["job_worker_concurrency"] = max(
+        1, min(32, values["job_worker_concurrency"])
     )
-    values["llm_api_key"] = os.getenv("LLM_API_KEY")
+    raw_refactor = os.getenv("AUTO_REFACTOR_TOPICS")
+    if raw_refactor is not None:
+        values["auto_refactor_topics"] = raw_refactor.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    raw_llm_thinking = os.getenv("LLM_ENABLE_THINKING")
+    if raw_llm_thinking is not None:
+        values["llm_enable_thinking"] = raw_llm_thinking.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    dashscope_api_key = os.getenv("DASHSCOPE_API_KEY")
+    values["stt_api_key"] = os.getenv("STT_API_KEY") or dashscope_api_key
+    if "dashscope.aliyuncs.com" in str(values["llm_base_url"]):
+        values["llm_api_key"] = (
+            dashscope_api_key or os.getenv("STT_API_KEY") or os.getenv("LLM_API_KEY")
+        )
+    else:
+        values["llm_api_key"] = os.getenv("LLM_API_KEY")
     values["oss_access_key_id"] = os.getenv("OSS_ACCESS_KEY_ID")
     values["oss_access_key_secret"] = os.getenv("OSS_ACCESS_KEY_SECRET")
     settings = Settings(**values)

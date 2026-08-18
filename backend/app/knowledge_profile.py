@@ -76,7 +76,7 @@ def normalize_knowledge_profile(raw: dict) -> dict:
         "scope": str(raw.get("scope") or "").strip()[:2000],
         "preferred_topics": topics,
         "rules": {
-            "ignore_out_of_scope": mode != "open",
+            "ignore_out_of_scope": mode == "strict",
             "merge_similar": True,
         },
     }
@@ -87,16 +87,23 @@ def profile_instructions(profile: dict) -> str:
     if mode == "open":
         return "当前为 open 模式：不限定知识领域，根据内容自由归类。"
     behavior = (
-        "优先归入推荐主题，但允许创建范围内的新主题。"
+        "scope 和推荐主题只是归类优先级，不是内容过滤器；优先按它们归类，"
+        "匹配不上时仍应保留其他有价值的知识并自由创建新主题。"
+        "即使 scope 中包含“忽略”或“排除”类描述，也不得据此返回 noop；"
+        "只有来源确实没有可持久的知识时才返回 noop。"
         if mode == "guided"
         else "只允许使用推荐主题中配置的路径，范围外内容必须 noop。"
     )
-    if profile["rules"]["ignore_out_of_scope"]:
+    if mode == "strict":
         behavior += " 与 scope 无关的内容必须 noop。"
     if profile["rules"]["merge_similar"]:
         behavior += " 语义相同的知识应精简合并。"
     prompt_profile = {
-        key: profile[key] for key in ("name", "mode", "scope", "preferred_topics", "rules")
+        key: profile[key] for key in ("name", "mode", "scope", "preferred_topics")
+    }
+    prompt_profile["rules"] = {
+        "ignore_out_of_scope": mode == "strict",
+        "merge_similar": True,
     }
     return (
         f"知识库 Profile（{mode}）：\n"

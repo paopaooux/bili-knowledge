@@ -234,6 +234,52 @@ class Database:
                     )
         return job_id
 
+    def create_job_if_absent(self, video_id: str, part_ids: list[str]) -> tuple[str, bool]:
+        """Create a job unless the same BVID and part selection was submitted before."""
+        job_id, now = str(uuid.uuid4()), utcnow()
+        with self.transaction() as connection:
+            requested = connection.execute(
+                f"""SELECT v.bvid,p.part_index FROM videos v JOIN parts p ON p.video_id=v.id
+                WHERE v.id=? AND p.id IN ({','.join('?' for _ in part_ids)})
+                ORDER BY p.part_index""",
+                (video_id, *part_ids),
+            ).fetchall()
+            requested_parts = tuple(row["part_index"] for row in requested)
+            if requested:
+                candidates = connection.execute(
+                    """SELECT j.id FROM jobs j JOIN videos v ON v.id=j.video_id
+                    WHERE v.bvid=? ORDER BY j.created_at DESC,j.id DESC""",
+                    (requested[0]["bvid"],),
+                ).fetchall()
+                for candidate in candidates:
+                    existing_parts = tuple(
+                        row["part_index"]
+                        for row in connection.execute(
+                            """SELECT p.part_index FROM job_parts jp
+                            JOIN parts p ON p.id=jp.part_id
+                            WHERE jp.job_id=? ORDER BY p.part_index""",
+                            (candidate["id"],),
+                        ).fetchall()
+                    )
+                    if existing_parts == requested_parts:
+                        return candidate["id"], False
+
+            connection.execute(
+                "INSERT INTO jobs(id,video_id,status,created_at,updated_at) VALUES (?,?,?,?,?)",
+                (job_id, video_id, "queued", now, now),
+            )
+            for part_id in part_ids:
+                connection.execute(
+                    "INSERT INTO job_parts(job_id,part_id,status) VALUES (?,?,?)",
+                    (job_id, part_id, "queued"),
+                )
+                for stage in STAGES:
+                    connection.execute(
+                        "INSERT INTO job_stages(job_id,part_id,stage,status) VALUES (?,?,?,?)",
+                        (job_id, part_id, stage, "pending"),
+                    )
+        return job_id, True
+
     def set_stage(
         self, job_id: str, part_id: str, stage: str, status: str, error: str | None = None
     ) -> None:
@@ -294,6 +340,8 @@ class Database:
 
     def _profile_from_row(self, row: dict) -> dict:
         rules = json.loads(row.pop("rules_json") or "{}")
+        rules["ignore_out_of_scope"] = row["mode"] == "strict"
+        rules["merge_similar"] = True
         row["is_active"] = bool(row["is_active"])
         row["rules"] = rules
         row["preferred_topics"] = self.all(
@@ -432,7 +480,7 @@ class Database:
         return job
 
     def list_jobs(self) -> list[dict]:
-        rows = self.all("SELECT id FROM jobs ORDER BY created_at DESC")
+        rows = self.all("SELECT id FROM jobs ORDER BY updated_at DESC,created_at DESC,id DESC")
         return [detail for row in rows if (detail := self.job_detail(row["id"]))]
 
     def recover_interrupted(self) -> list[str]:

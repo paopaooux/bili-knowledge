@@ -42,6 +42,7 @@ export const api = {
     method: 'POST', body: JSON.stringify({ service }),
   }),
   knowledgeFiles: () => request<KnowledgeFile[]>('/api/knowledge/files'),
+  regenerateKnowledge: () => request<{ queued_jobs: number; queued_parts: number }>('/api/knowledge/regenerate', { method: 'POST' }),
   knowledgeFile: (path: string) => request<string>(`/api/knowledge/file?path=${encodeURIComponent(path)}`),
   refactorKnowledgeFile: (path: string) => request<string>(`/api/knowledge/file/refactor?path=${encodeURIComponent(path)}`, { method: 'POST' }),
   knowledgeDownloadUrl: (path: string) => `/api/knowledge/file/download?path=${encodeURIComponent(path)}`,

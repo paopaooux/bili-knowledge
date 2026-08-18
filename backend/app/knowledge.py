@@ -48,6 +48,20 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _schema_protocol(heading: str, next_heading: str | None = None) -> str:
+    """Return only the protocol needed by one LLM stage to avoid schema confusion."""
+    schema = SCHEMA_PATH.read_text(encoding="utf-8")
+    marker = f"## {heading}"
+    start = schema.find(marker)
+    if start < 0:
+        raise RuntimeError(f"知识整理协议缺少章节：{heading}")
+    if next_heading:
+        end = schema.find(f"## {next_heading}", start + len(marker))
+        if end >= 0:
+            return schema[start:end].strip()
+    return schema[start:].strip()
+
+
 def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
@@ -71,14 +85,70 @@ def _json_response(value: str, label: str) -> dict:
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end < start:
-        raise KnowledgeOrganizerError(f"{label}没有返回 JSON 对象")
+        raise KnowledgeOrganizerError(f"{label}没有返回 JSON 对象，输出开头为：{text[:120]}")
     try:
         result = json.loads(text[start : end + 1])
     except json.JSONDecodeError as exc:
-        raise KnowledgeOrganizerError(f"{label}返回了无效 JSON：{exc}") from exc
+        raise KnowledgeOrganizerError(
+            f"{label}返回了无效 JSON：{exc}，输出开头为：{text[:120]}"
+        ) from exc
     if not isinstance(result, dict):
-        raise KnowledgeOrganizerError(f"{label}必须返回 JSON 对象")
+        raise KnowledgeOrganizerError(f"{label}必须返回 JSON 对象，输出开头为：{text[:120]}")
     return result
+
+
+def _chat_json(
+    messages: list[dict],
+    settings: Settings,
+    label: str,
+    max_tokens: int,
+    chat_func: ChatFunction,
+    required_array_field: str | None = None,
+) -> dict:
+    """调用模型并要求返回 JSON；语法或顶层数组结构错误时纠正重试一次。"""
+    last_error: KnowledgeOrganizerError | None = None
+    for attempt in range(2):
+        response = chat_func(messages, settings, max_tokens=max_tokens)
+        try:
+            result = _json_response(response, label)
+            if required_array_field and not isinstance(
+                result.get(required_array_field), list
+            ):
+                raise KnowledgeOrganizerError(
+                    f"{label} {required_array_field} 必须是数组"
+                )
+            return result
+        except KnowledgeOrganizerError as exc:
+            if not str(exc).startswith(label):
+                raise
+            last_error = exc
+            logger.warning(
+                "Knowledge %s returned invalid JSON or schema attempt=%d snippet=%r",
+                label,
+                attempt + 1,
+                response[:120],
+            )
+            messages = [
+                *messages,
+                {"role": "assistant", "content": response[:4000]},
+                {
+                    "role": "user",
+                    "content": (
+                        "刚才的输出不是有效的 JSON，或者不符合指定的 JSON 结构。"
+                        "请重新输出一个完整、合法的 JSON 对象，"
+                        + (
+                            f'只输出以 "{required_array_field}" 为唯一顶层字段的对象，'
+                            f"且 {required_array_field} 必须是数组；"
+                            "不要输出其他处理阶段的协议。"
+                            if required_array_field
+                            else ""
+                        )
+                        + "不要使用代码围栏、不要省略任何字段、不要输出任何解释文字。"
+                    ),
+                },
+            ]
+    assert last_error is not None
+    raise last_error
 
 
 def _load_catalog(path: Path) -> dict:
@@ -121,7 +191,7 @@ def _route(
         for item in catalog["topics"]
         if isinstance(item, dict) and item.get("path") and item.get("title")
     ]
-    response = chat_func(
+    value = _chat_json(
         [
             {
                 "role": "system",
@@ -129,7 +199,9 @@ def _route(
                     PROMPTS_DIR / "route-system.md",
                     skill=SKILL_PATH.read_text(encoding="utf-8"),
                     profile_instructions=profile_instructions(profile),
-                    schema=SCHEMA_PATH.read_text(encoding="utf-8"),
+                    schema=_schema_protocol(
+                        "Multi-topic routing response", "Batched update plan"
+                    ),
                 ),
             },
             {
@@ -142,12 +214,14 @@ def _route(
             },
         ],
         settings,
-        max_tokens=3000,
+        "知识路由",
+        max_tokens=12000,
+        chat_func=chat_func,
+        required_array_field="topics",
     )
-    value = _json_response(response, "知识路由")
     raw_topics = value.get("topics")
-    if not isinstance(raw_topics, list) or len(raw_topics) > 8:
-        raise KnowledgeOrganizerError("知识路由 topics 必须是最多 8 项的数组")
+    if not isinstance(raw_topics, list):
+        raise KnowledgeOrganizerError("知识路由 topics 必须是数组")
     logger.info(
         "Knowledge routing response topic_count=%d topics=%s",
         len(raw_topics),
@@ -185,6 +259,9 @@ def _route(
         focus = str(topic.get("focus") or "").strip()
         if not focus:
             raise KnowledgeOrganizerError("知识路由 focus 不能为空")
+        known_candidates = [str(item) for item in candidates if item in known_paths]
+        if suggested_path in known_paths:
+            known_candidates.insert(0, suggested_path)
         routes.append(
             {
                 "title": str(topic.get("title") or PurePosixPath(suggested_path).stem).strip()[:100],
@@ -192,9 +269,7 @@ def _route(
                 "suggested_path": suggested_path,
                 "aliases": [str(item).strip()[:100] for item in raw_aliases[:10]],
                 "summary": str(topic.get("summary") or "").strip()[:500],
-                "candidate_paths": list(
-                    dict.fromkeys(str(item) for item in candidates if item in known_paths)
-                )[:3],
+                "candidate_paths": list(dict.fromkeys(known_candidates))[:3],
             }
         )
     merged_routes: dict[str, dict] = {}
@@ -248,7 +323,7 @@ def _plan(
     settings: Settings,
     chat_func: ChatFunction,
 ) -> list[dict]:
-    response = chat_func(
+    raw = _chat_json(
         [
             {
                 "role": "system",
@@ -256,7 +331,7 @@ def _plan(
                     PROMPTS_DIR / "plan-system.md",
                     skill=SKILL_PATH.read_text(encoding="utf-8"),
                     profile_instructions=profile_instructions(profile),
-                    schema=SCHEMA_PATH.read_text(encoding="utf-8"),
+                    schema=_schema_protocol("Batched update plan"),
                 ),
             },
             {
@@ -270,21 +345,40 @@ def _plan(
             },
         ],
         settings,
-        max_tokens=8000,
+        "知识整理",
+        max_tokens=12000,
+        chat_func=chat_func,
+        required_array_field="updates",
     )
-    raw = _json_response(response, "知识整理")
+    candidate_paths = {
+        path for route in routes for path in route["candidate_paths"]
+    }
+    raw_updates = raw.get("updates") if isinstance(raw, dict) else None
+    if isinstance(raw_updates, list):
+        normalized_updates = []
+        for item in raw_updates:
+            if (
+                isinstance(item, dict)
+                and item.get("action") == "create"
+                and item.get("target_path") in existing_paths
+                and item.get("target_path") in candidate_paths
+            ):
+                logger.warning(
+                    "Knowledge plan corrected create to merge for existing candidate path=%s",
+                    item["target_path"],
+                )
+                item = {**item, "action": "merge"}
+            normalized_updates.append(item)
+        raw = {**raw, "updates": normalized_updates}
     try:
         plans = validate_update_batch(raw, existing_paths)
     except ValueError as exc:
         raise KnowledgeOrganizerError(f"知识更新计划未通过校验：{exc}") from exc
-    candidate_paths = {
-        path for route in routes for path in route["candidate_paths"]
-    }
     suggested_paths = {route["suggested_path"] for route in routes}
     for plan in plans:
         if plan["action"] == "merge" and plan["target_path"] not in candidate_paths:
             raise KnowledgeOrganizerError("模型试图合并未读取的主题")
-        if plan["action"] in {"create", "link"} and plan["target_path"] not in suggested_paths:
+        if plan["action"] == "create" and plan["target_path"] not in suggested_paths:
             raise KnowledgeOrganizerError("模型试图创建未经路由的主题")
         try:
             validate_profile_plan(profile, plan)
@@ -306,6 +400,13 @@ def _without_legacy_sections(content: str) -> str:
     return content[: min(positions)].rstrip() if positions else content.rstrip()
 
 
+TOPIC_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\([^)]*\.md(?:#[^)]*)?\)", re.IGNORECASE)
+
+
+def _without_topic_links(content: str) -> str:
+    return TOPIC_LINK_PATTERN.sub(r"\1", content)
+
+
 def _render_topic(plan: dict, existing: str | None) -> str:
     disagreements = plan["sections"]["disagreements"]
     replacements = {
@@ -321,7 +422,40 @@ def _render_topic(plan: dict, existing: str | None) -> str:
     result = TEMPLATE_PATH.read_text(encoding="utf-8")
     for marker, value in replacements.items():
         result = result.replace(marker, value)
-    return result.rstrip() + "\n"
+    return _without_topic_links(result).rstrip() + "\n"
+
+
+def _append_unique_bullets(content: str, heading: str, values: list[str]) -> str:
+    additions = [value for value in values if value and value not in content]
+    if not additions:
+        return content
+    block = _bullets(additions)
+    heading_match = re.search(rf"(?m)^{re.escape(heading)}\s*$", content)
+    if not heading_match:
+        return content.rstrip() + f"\n\n{heading}\n\n{block}\n"
+    next_heading = re.search(r"(?m)^##\s+", content[heading_match.end() :])
+    insert_at = (
+        heading_match.end() + next_heading.start()
+        if next_heading
+        else len(content.rstrip())
+    )
+    before = content[:insert_at].rstrip()
+    after = content[insert_at:].lstrip("\n")
+    result = before + "\n\n" + block + "\n"
+    if after:
+        result += "\n" + after
+    return result
+
+
+def _merge_topic_increment(existing: str, plan: dict) -> str:
+    result = _without_legacy_sections(existing)
+    result = _append_unique_bullets(result, "## 核心知识", plan["sections"]["knowledge"])
+    result = _append_unique_bullets(
+        result,
+        "## 不同观点与争议",
+        plan["sections"]["disagreements"],
+    )
+    return _without_topic_links(result).rstrip() + "\n"
 
 
 def _apply_plan(
@@ -341,7 +475,11 @@ def _apply_plan(
     elif current is not None:
         raise KnowledgeOrganizerError("新主题路径已被占用，已停止写入")
 
-    rendered = _render_topic(plan, current)
+    rendered = (
+        _merge_topic_increment(current, plan)
+        if plan["action"] == "merge" and current is not None
+        else _render_topic(plan, current)
+    )
     try:
         _atomic_write(target, rendered)
         updated_at = datetime.fromtimestamp(target.stat().st_mtime, tz=UTC).isoformat()
@@ -407,7 +545,7 @@ def refactor_topic_document(
             {"role": "user", "content": knowledge_content},
         ],
         settings,
-        max_tokens=8000,
+        max_tokens=12000,
     )
     refactored = re.sub(
         r"^```(?:markdown|md)?\s*|\s*```$", "", response.strip(), flags=re.IGNORECASE
@@ -488,6 +626,25 @@ def organize_document(
                 target, previous = _apply_plan(plan, catalog, topics_root, expected_hashes)
                 if target:
                     applied.append((target, previous))
+            if applied and settings.auto_refactor_topics:
+                for plan, (target, _) in zip(plans, applied, strict=True):
+                    if plan["action"] != "merge":
+                        continue
+                    try:
+                        refactor_topic_document(target, settings, chat_func=chat_func)
+                    except (KnowledgeOrganizerError, AIServiceError) as exc:
+                        logger.warning(
+                            "Auto topic refactor skipped path=%s error=%s", target, exc
+                        )
+                        continue
+                    refreshed = target.read_text(encoding="utf-8")
+                    for item in catalog["topics"]:
+                        if item.get("path") == plan["target_path"]:
+                            item["updated_at"] = datetime.fromtimestamp(
+                                target.stat().st_mtime, tz=UTC
+                            ).isoformat()
+                            item["content_sha256"] = _sha256(refreshed)
+                            break
             if applied:
                 _atomic_write(
                     catalog_path,

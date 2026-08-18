@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
+import re
 import subprocess
 import time
 import uuid
@@ -19,9 +21,27 @@ from .config import Settings
 
 logger = logging.getLogger("uvicorn.error")
 
+RETRYABLE_LLM_STATUS_CODES = {502, 503, 504}
+LLM_GATEWAY_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
+
 
 class AIServiceError(RuntimeError):
     pass
+
+
+def _retryable_llm_status(error: BaseException) -> int | None:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, httpx.HTTPStatusError):
+            status = current.response.status_code
+            return status if status in RETRYABLE_LLM_STATUS_CODES else None
+        current = current.__cause__
+    # Some OpenAI-compatible gateways accept the HTTP stream with status 200 and then
+    # report an upstream 5xx failure inside an SSE error event.
+    match = re.search(r"\[(502|503|504)\]", str(error))
+    if match:
+        return int(match.group(1))
+    return None
 
 
 def _headers(key: str | None) -> dict[str, str]:
@@ -30,26 +50,14 @@ def _headers(key: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {key}"}
 
 
-def _transcribe_openai_compatible(path: Path, settings: Settings) -> dict:
-    url = settings.stt_base_url.rstrip("/") + "/audio/transcriptions"
-    try:
-        with (
-            path.open("rb") as audio,
-            httpx.Client(timeout=settings.request_timeout_seconds) as client,
-        ):
-            response = client.post(
-                url,
-                headers=_headers(settings.stt_api_key),
-                data={"model": settings.stt_model, "response_format": "verbose_json"},
-                files={"file": (path.name, audio, "audio/mpeg")},
-            )
-            response.raise_for_status()
-            payload = response.json()
-    except (httpx.HTTPError, ValueError, OSError) as exc:
-        raise AIServiceError(f"语音转写请求失败：{exc}") from exc
-    if not payload.get("text") and not payload.get("segments"):
-        raise AIServiceError("语音转写接口返回了空内容")
-    return payload
+def _require_model_config(base_url: str, model: str, prefix: str) -> None:
+    missing = []
+    if not base_url:
+        missing.append(f"{prefix}_BASE_URL")
+    if not model:
+        missing.append(f"{prefix}_MODEL")
+    if missing:
+        raise AIServiceError(f"尚未配置 {', '.join(missing)}")
 
 
 class _QwenASRCallback(OmniRealtimeCallback):
@@ -181,13 +189,14 @@ def _transcribe_dashscope_realtime(path: Path, settings: Settings) -> dict:
 
 
 def transcribe_audio(path: Path, settings: Settings) -> dict:
+    _require_model_config(settings.stt_base_url, settings.stt_model, "STT")
     if settings.stt_provider == "dashscope_realtime":
         return _transcribe_dashscope_realtime(path, settings)
     if settings.stt_provider == "dashscope_flash":
         return _transcribe_dashscope_flash(path, settings)
     if settings.stt_provider == "dashscope_filetrans":
         return _transcribe_dashscope_filetrans(path, settings)
-    return _transcribe_openai_compatible(path, settings)
+    raise AIServiceError(f"不支持的语音转写方式：{settings.stt_provider}")
 
 
 def _value(value, key: str, default=None):
@@ -199,24 +208,33 @@ def _value(value, key: str, default=None):
 def _transcribe_dashscope_flash(path: Path, settings: Settings) -> dict:
     _headers(settings.stt_api_key)
     dashscope.base_http_api_url = settings.stt_base_url.rstrip("/")
+    call_options = {
+        "api_key": settings.stt_api_key,
+        "model": settings.stt_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "text": "请忠实转写音频中的所有语音，只输出转写文本，不要总结或回答内容。"
+                    }
+                ],
+            },
+            {"role": "user", "content": [{"audio": path.resolve().as_uri()}]},
+        ],
+        "result_format": "message",
+    }
+    if settings.stt_model.startswith("qwen3-asr-"):
+        call_options["asr_options"] = {"enable_lid": True, "enable_itn": False}
     try:
-        response = dashscope.MultiModalConversation.call(
-            api_key=settings.stt_api_key,
-            model=settings.stt_model,
-            messages=[
-                {"role": "system", "content": [{"text": ""}]},
-                {"role": "user", "content": [{"audio": path.resolve().as_uri()}]},
-            ],
-            result_format="message",
-            asr_options={"enable_lid": True, "enable_itn": False},
-        )
+        response = dashscope.MultiModalConversation.call(**call_options)
     except Exception as exc:
-        raise AIServiceError(f"千问 Qwen3-ASR-Flash 转写失败：{exc}") from exc
+        raise AIServiceError(f"千问 {settings.stt_model} 转写失败：{exc}") from exc
 
     status_code = _value(response, "status_code", 200)
     if status_code != 200:
         message = _value(response, "message") or _value(response, "code") or status_code
-        raise AIServiceError(f"千问 Qwen3-ASR-Flash 转写失败：{message}")
+        raise AIServiceError(f"千问 {settings.stt_model} 转写失败：{message}")
     try:
         output = _value(response, "output")
         choices = _value(output, "choices", [])
@@ -224,9 +242,9 @@ def _transcribe_dashscope_flash(path: Path, settings: Settings) -> dict:
         content = _value(message, "content", [])
         text = "".join(str(_value(item, "text", "")) for item in content).strip()
     except (IndexError, TypeError) as exc:
-        raise AIServiceError("千问 Qwen3-ASR-Flash 返回结构异常") from exc
+        raise AIServiceError(f"千问 {settings.stt_model} 返回结构异常") from exc
     if not text:
-        raise AIServiceError("千问 Qwen3-ASR-Flash 未返回有效文本")
+        raise AIServiceError(f"千问 {settings.stt_model} 未返回有效文本")
     return {"text": text, "segments": [], "language": "unknown"}
 
 
@@ -353,31 +371,157 @@ def _transcribe_dashscope_filetrans(path: Path, settings: Settings) -> dict:
 
 
 def chat(messages: list[dict], settings: Settings, max_tokens: int = 3000) -> str:
+    _require_model_config(settings.llm_base_url, settings.llm_model, "LLM")
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     input_chars = sum(len(str(message.get("content", ""))) for message in messages)
+    started = time.monotonic()
+    budget = max_tokens
+    attempts = 0
+    gateway_retries = 0
+    while True:
+        try:
+            content, reasoning_chars, truncated = _stream_chat(messages, settings, url, budget)
+        except AIServiceError as exc:
+            status = _retryable_llm_status(exc)
+            if status is None or gateway_retries >= len(LLM_GATEWAY_RETRY_DELAYS_SECONDS):
+                raise
+            delay = LLM_GATEWAY_RETRY_DELAYS_SECONDS[gateway_retries]
+            gateway_retries += 1
+            attempts += 1
+            logger.warning(
+                "LLM gateway request failed; retrying model=%s status=%d retry=%d delay=%ds",
+                settings.llm_model,
+                status,
+                gateway_retries,
+                delay,
+            )
+            time.sleep(delay)
+            continue
+        # 输出被 max_tokens 截断时，用双倍额度重试一次，避免把半截 JSON 交给上层。
+        if truncated and budget < 32768:
+            attempts += 1
+            budget = min(budget * 2, 32768)
+            logger.warning(
+                "LLM output truncated by max_tokens input_chars=%d old_max_tokens=%d retry_max_tokens=%d",
+                input_chars,
+                budget // 2,
+                budget,
+            )
+            continue
+        if content:
+            logger.info(
+                "LLM request completed model=%s output_chars=%d elapsed=%.2fs attempts=%d",
+                settings.llm_model,
+                len(content),
+                time.monotonic() - started,
+                attempts + 1,
+            )
+            return content
+        if not reasoning_chars:
+            raise AIServiceError("知识稿模型返回了空内容")
+        if budget >= 32768:
+            raise AIServiceError(
+                "知识稿模型把输出额度全部用在了思考上，没有产出正文。"
+                "系统已自动把 max_tokens 扩到 32768；请设置 "
+                "LLM_ENABLE_THINKING=false 后重启服务，或改用非思考模型。"
+            )
+        attempts += 1
+        budget = min(budget * 2, 32768)
+        logger.warning(
+            "LLM reasoning consumed the budget input_chars=%d old_max_tokens=%d retry_max_tokens=%d",
+            input_chars,
+            budget // 2,
+            budget,
+        )
+
+
+def _stream_chat(
+    messages: list[dict],
+    settings: Settings,
+    url: str,
+    max_tokens: int,
+) -> tuple[str, int, bool]:
+    request_payload = {
+        "model": settings.llm_model,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    if settings.llm_enable_thinking is not None:
+        request_payload["enable_thinking"] = settings.llm_enable_thinking
+    if settings.llm_model == "qwen3.5-omni-plus":
+        request_payload.update(
+            {
+                "stream_options": {"include_usage": True},
+                "modalities": ["text", "audio"],
+                "audio": {"voice": "Ethan", "format": "wav"},
+            }
+        )
     started = time.monotonic()
     logger.info(
         "LLM request started model=%s messages=%d input_chars=%d max_tokens=%d",
         settings.llm_model,
         len(messages),
-        input_chars,
+        sum(len(str(message.get("content", ""))) for message in messages),
         max_tokens,
     )
     try:
-        with httpx.Client(timeout=settings.request_timeout_seconds) as client:
-            response = client.post(
+        with (
+            httpx.Client(timeout=settings.request_timeout_seconds) as client,
+            client.stream(
+                "POST",
                 url,
                 headers={**_headers(settings.llm_api_key), "Content-Type": "application/json"},
-                json={
-                    "model": settings.llm_model,
-                    "messages": messages,
-                    "temperature": 0.2,
-                    "max_tokens": max_tokens,
-                },
-            )
+                json=request_payload,
+            ) as response,
+        ):
             response.raise_for_status()
-            payload = response.json()
-        content = payload["choices"][0]["message"]["content"].strip()
+            parts = []
+            audio_transcript_parts = []
+            reasoning_chars = 0
+            truncated = False
+            for line in response.iter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                payload = json.loads(data)
+                if not isinstance(payload, dict):
+                    continue
+                error = payload.get("error")
+                if error:
+                    if isinstance(error, dict):
+                        message = error.get("message") or error.get("code") or str(error)
+                    else:
+                        message = str(error)
+                    raise AIServiceError(f"知识稿模型返回错误：{message}")
+                choices = payload.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    logger.debug("Ignored LLM stream event without choices keys=%s", payload.keys())
+                    continue
+                choice = choices[0]
+                if not isinstance(choice, dict):
+                    continue
+                if choice.get("finish_reason") == "length":
+                    truncated = True
+                delta = choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    continue
+                piece = delta.get("content")
+                if piece:
+                    parts.append(str(piece))
+                reasoning = delta.get("reasoning_content")
+                if reasoning:
+                    reasoning_chars += len(str(reasoning))
+                audio = delta.get("audio")
+                if isinstance(audio, dict) and audio.get("transcript"):
+                    audio_transcript_parts.append(str(audio["transcript"]))
+        content = "".join(parts).strip() or "".join(audio_transcript_parts).strip()
+        return content, reasoning_chars, truncated
+    except AIServiceError:
+        raise
     except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
         logger.warning(
             "LLM request failed model=%s elapsed=%.2fs error_type=%s",
@@ -386,21 +530,14 @@ def chat(messages: list[dict], settings: Settings, max_tokens: int = 3000) -> st
             type(exc).__name__,
         )
         raise AIServiceError(f"知识稿模型请求失败：{exc}") from exc
-    if not content:
-        raise AIServiceError("知识稿模型返回了空内容")
-    logger.info(
-        "LLM request completed model=%s output_chars=%d elapsed=%.2fs",
-        settings.llm_model,
-        len(content),
-        time.monotonic() - started,
-    )
-    return content
 
 
 def test_service(service: str, settings: Settings) -> dict:
     if service == "llm":
-        result = chat([{"role": "user", "content": "只回复 OK"}], settings, max_tokens=8)
+        _require_model_config(settings.llm_base_url, settings.llm_model, "LLM")
+        result = chat([{"role": "user", "content": "只回复 OK"}], settings, max_tokens=2000)
         return {"service": service, "ok": True, "message": result[:100]}
+    _require_model_config(settings.stt_base_url, settings.stt_model, "STT")
     if settings.stt_provider == "dashscope_realtime":
         callback = _QwenASRCallback()
         conversation = _qwen_conversation(settings, callback)
@@ -429,7 +566,7 @@ def test_service(service: str, settings: Settings) -> dict:
         return {
             "service": service,
             "ok": True,
-            "message": "千问 Qwen3-ASR-Flash 配置完整（未发起付费转写）",
+            "message": f"千问 {settings.stt_model} 配置完整（未发起付费转写）",
         }
     url = settings.stt_base_url.rstrip("/") + "/models"
     try:

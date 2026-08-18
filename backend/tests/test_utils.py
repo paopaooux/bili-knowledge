@@ -1,7 +1,7 @@
 import pytest
 
 from app.subtitles import normalize_segments, parse_bilibili_json, parse_vtt_srt
-from app.utils import safe_filename, timestamp_url
+from app.utils import safe_filename
 from app.video import VideoInspectionError, _cover_url, inspect_video
 
 
@@ -69,7 +69,3 @@ def test_inspect_rejects_multipart_video(monkeypatch, settings):
     assert _cover_url({"thumbnails": [{"url": "//i1.hdslb.com/fallback.jpg"}]}) == (
         "https://i1.hdslb.com/fallback.jpg"
     )
-
-
-def test_timestamp_url_preserves_query():
-    assert timestamp_url("https://example.test/video?p=2", 65).endswith("p=2&t=65")

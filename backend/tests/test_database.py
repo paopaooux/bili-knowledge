@@ -34,6 +34,18 @@ def test_job_persists_parts_stages_and_artifacts(settings):
     assert "重启" in stage["error"]
 
 
+def test_jobs_are_ordered_by_last_update(settings):
+    db = Database(settings.database_path)
+    db.migrate()
+    video = db.save_inspection(inspection())
+    older = db.create_job(video["id"], [video["parts"][0]["id"]])
+    newer = db.create_job(video["id"], [video["parts"][1]["id"]])
+    db.execute("UPDATE jobs SET updated_at=? WHERE id=?", ("2026-01-03T00:00:00+00:00", older))
+    db.execute("UPDATE jobs SET updated_at=? WHERE id=?", ("2026-01-02T00:00:00+00:00", newer))
+
+    assert [job["id"] for job in db.list_jobs()] == [older, newer]
+
+
 def test_migration_is_idempotent(settings):
     db = Database(settings.database_path)
     db.migrate()
@@ -104,5 +116,6 @@ def test_profiles_persist_topics_and_active_selection(settings):
     assert db.active_knowledge_profile()["id"] == first["id"]
     activated = db.activate_knowledge_profile(second["id"])
     assert activated["is_active"] is True
+    assert activated["rules"]["ignore_out_of_scope"] is False
     assert activated["preferred_topics"][0]["path"] == "个人成长/学习方法.md"
     assert db.delete_knowledge_profile(first["id"]) is True

@@ -1,9 +1,11 @@
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from app.ai import AIServiceError
 from app.knowledge import (
     KnowledgeOrganizerError,
     organize_document,
@@ -11,6 +13,27 @@ from app.knowledge import (
     validate_update_batch,
     validate_update_plan,
 )
+
+
+def _topic_plan(index: int) -> dict:
+    return {
+        "action": "create",
+        "target_path": f"分类/主题{index}.md",
+        "title": f"主题{index}",
+        "aliases": [],
+        "summary": f"主题{index}摘要",
+        "sections": {
+            "overview": f"主题{index}概述。",
+            "knowledge": [f"主题{index}知识。"],
+            "disagreements": [],
+        },
+    }
+
+
+def test_batch_accepts_more_than_fifteen_topics():
+    plans = [_topic_plan(index) for index in range(20)]
+
+    assert len(validate_update_batch({"updates": plans}, set())) == 20
 
 
 def _document(path: Path, title: str = "高效学习视频") -> Path:
@@ -110,6 +133,7 @@ def test_organizer_creates_topic_and_index(settings, tmp_path: Path):
 
 
 def test_organizer_merges_topic_without_legacy_sections_and_uses_mtime(settings, tmp_path: Path):
+    settings.auto_refactor_topics = False  # this test checks the append-increment mechanism
     first_source = _document(tmp_path / "first.md")
     first_responses = _create_responses()
     organize_document(
@@ -118,10 +142,7 @@ def test_organizer_merges_topic_without_legacy_sections_and_uses_mtime(settings,
         chat_func=lambda *args, **kwargs: next(first_responses),
     )
     topic = settings.knowledge_base_dir / "topics/个人成长/学习方法/间隔复习.md"
-    topic.write_text(
-        topic.read_text(encoding="utf-8") + "\n用户自己的观察。\n",
-        encoding="utf-8",
-    )
+    original_content = topic.read_text(encoding="utf-8")
     second_source = _document(tmp_path / "second.md", "学习方法补充视频")
     responses = iter(
         [
@@ -150,8 +171,11 @@ def test_organizer_merges_topic_without_legacy_sections_and_uses_mtime(settings,
                             "aliases": ["分散学习"],
                             "summary": "通过合理安排复习间隔巩固记忆",
                             "sections": {
-                                "overview": "间隔复习是在不同时间重新练习所学内容。",
-                                "knowledge": ["旧知识。", "新补充知识。"],
+                            "overview": "",
+                            "knowledge": [
+                                "间隔复习有助于巩固记忆。",
+                                "新补充知识可参见[其他主题](../其他主题.md)。",
+                            ],
                                 "disagreements": [],
                                 "sources": [
                                     "[高效学习视频](https://example.test/video?t=10)",
@@ -174,8 +198,11 @@ def test_organizer_merges_topic_without_legacy_sections_and_uses_mtime(settings,
     )
 
     merged = topic.read_text(encoding="utf-8")
+    assert original_content.rstrip() in merged
     assert "新补充知识" in merged
-    assert "用户自己的观察" not in merged
+    assert merged.count("间隔复习有助于巩固记忆。") == 1
+    assert "[其他主题]" not in merged
+    assert "新补充知识可参见其他主题。" in merged
     assert "## 我的笔记" not in merged
     assert "## 相关主题" not in merged
     expected_updated_at = datetime.fromtimestamp(topic.stat().st_mtime, tz=UTC).isoformat()
@@ -476,6 +503,77 @@ def test_merge_cannot_target_unread_topic(settings, tmp_path: Path):
         )
 
 
+def test_existing_suggested_path_is_read_and_create_is_corrected_to_merge(
+    settings, tmp_path: Path
+):
+    settings.auto_refactor_topics = False
+    source = _document(tmp_path / "document.md")
+    topics = settings.knowledge_base_dir / "topics"
+    topics.mkdir(parents=True)
+    existing_content = "# 已有主题\n\n## 核心知识\n\n- 已有内容。\n"
+    (topics / "已有主题.md").write_text(existing_content, encoding="utf-8")
+    (topics / "index.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": None,
+                "topics": [{"path": "已有主题.md", "title": "已有主题"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    responses = iter(
+        [
+            json.dumps(
+                {
+                    "topics": [
+                        {
+                            "title": "已有主题",
+                            "focus": "新增知识",
+                            "suggested_path": "已有主题.md",
+                            "candidate_paths": [],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "updates": [
+                        {
+                            "action": "create",
+                            "target_path": "已有主题.md",
+                            "title": "已有主题",
+                            "aliases": [],
+                            "summary": "",
+                            "sections": {
+                                "overview": "概述",
+                                "knowledge": ["新增内容。"],
+                                "disagreements": [],
+                                "sources": [],
+                            },
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+        ]
+    )
+
+    result = organize_document(
+        source,
+        settings,
+        chat_func=lambda *args, **kwargs: next(responses),
+    )
+
+    assert result["routes"][0]["candidate_paths"] == ["已有主题.md"]
+    assert result["updates"][0]["plan"]["action"] == "merge"
+    content = (topics / "已有主题.md").read_text(encoding="utf-8")
+    assert "已有内容。" in content
+    assert "新增内容。" in content
+
+
 def test_one_source_is_split_into_distinct_topic_files(settings, tmp_path: Path):
     source = _document(tmp_path / "document.md", "个人成长综合知识")
     responses = iter(
@@ -558,3 +656,229 @@ def test_one_source_is_split_into_distinct_topic_files(settings, tmp_path: Path)
         )["topics"]
     }
     assert catalog_paths == {"个人成长/时间管理.md", "健康生活/运动习惯.md"}
+
+
+def test_organize_auto_refactors_merged_topic(settings, tmp_path: Path):
+    source = _document(tmp_path / "document.md")
+    first_responses = _create_responses()
+    organize_document(source, settings, chat_func=lambda *args, **kwargs: next(first_responses))
+    topic = settings.knowledge_base_dir / "topics/个人成长/学习方法/间隔复习.md"
+    assert topic.is_file()
+
+    refactored = (
+        "# 间隔复习\n\n## 核心知识\n\n"
+        "- 间隔复习要逐渐拉长复习间隔\n"
+        "  - 两个来源都强调间隔逐渐拉长，而不是固定频率\n"
+        "  - 补充案例：考前一周开始，第一天、第三天、第七天各复习一次\n"
+    )
+    responses = iter(
+        [
+            json.dumps(
+                {
+                    "topics": [
+                        {
+                            "title": "间隔复习",
+                            "focus": "补充间隔复习知识",
+                            "suggested_path": "个人成长/学习方法/间隔复习.md",
+                            "aliases": [],
+                            "summary": "补充学习方法知识",
+                            "candidate_paths": ["个人成长/学习方法/间隔复习.md"],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "updates": [
+                        {
+                            "action": "merge",
+                            "target_path": "个人成长/学习方法/间隔复习.md",
+                            "title": "间隔复习",
+                            "aliases": [],
+                            "summary": "补充学习方法知识",
+                            "sections": {
+                                "overview": "",
+                                "knowledge": ["新来源补充的间隔复习细节。"],
+                                "disagreements": [],
+                                "sources": [],
+                            },
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            refactored,
+        ]
+    )
+
+    result = organize_document(
+        _document(tmp_path / "second.md", "学习方法补充视频"),
+        settings,
+        chat_func=lambda *args, **kwargs: next(responses),
+    )
+
+    written = topic.read_text(encoding="utf-8")
+    assert written == refactored
+    assert "新来源补充的间隔复习细节" not in written  # fused into the consolidated discussion
+    assert "两个来源都强调" in written
+    index = json.loads(
+        (settings.knowledge_base_dir / "topics/index.json").read_text(encoding="utf-8")
+    )
+    entry = index["topics"][0]
+    expected_updated_at = datetime.fromtimestamp(topic.stat().st_mtime, tz=UTC).isoformat()
+    assert entry["updated_at"] == expected_updated_at
+    assert entry["content_sha256"] == hashlib.sha256(refactored.encode("utf-8")).hexdigest()
+    assert result["updates"][0]["plan"]["action"] == "merge"
+
+
+@pytest.mark.parametrize(
+    "refactor_error",
+    [KnowledgeOrganizerError("模拟重构失败"), AIServiceError("模型未输出正文")],
+)
+def test_organize_tolerates_auto_refactor_failure(
+    settings, tmp_path: Path, refactor_error: Exception
+):
+    source = _document(tmp_path / "document.md")
+    first_responses = _create_responses()
+    organize_document(source, settings, chat_func=lambda *args, **kwargs: next(first_responses))
+    topic = settings.knowledge_base_dir / "topics/个人成长/学习方法/间隔复习.md"
+
+    calls = {"count": 0}
+
+    def chat_mock(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return json.dumps(
+                {
+                    "topics": [
+                        {
+                            "title": "间隔复习",
+                            "focus": "补充间隔复习知识",
+                            "suggested_path": "个人成长/学习方法/间隔复习.md",
+                            "aliases": [],
+                            "summary": "补充学习方法知识",
+                            "candidate_paths": ["个人成长/学习方法/间隔复习.md"],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        if calls["count"] == 2:
+            return json.dumps(
+                {
+                    "updates": [
+                        {
+                            "action": "merge",
+                            "target_path": "个人成长/学习方法/间隔复习.md",
+                            "title": "间隔复习",
+                            "aliases": [],
+                            "summary": "补充学习方法知识",
+                            "sections": {
+                                "overview": "",
+                                "knowledge": ["新来源补充的间隔复习细节。"],
+                                "disagreements": [],
+                                "sources": [],
+                            },
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        raise refactor_error
+
+    result = organize_document(
+        _document(tmp_path / "second.md", "学习方法补充视频"),
+        settings,
+        chat_func=chat_mock,
+    )
+
+    assert calls["count"] == 3
+    merged = topic.read_text(encoding="utf-8")
+    assert "新来源补充的间隔复习细节" in merged  # merge applied even though refactor failed
+    assert len(result["updates"]) == 1
+
+
+def test_chat_json_retries_once_when_response_is_invalid_json(settings):
+    from app.knowledge import _chat_json
+
+    calls = []
+
+    def fake_chat(messages, settings, **kwargs):
+        calls.append(messages)
+        if len(calls) == 1:
+            # 模拟输出被截断：对象没有闭合，正是 "Expecting ',' delimiter" 的场景
+            return (
+                '{"topics": [{"title": "间隔复习", "focus": "学习方法", '
+                '"suggested_path": "个人成长/间隔复习.md"}'
+            )
+        return json.dumps(
+            {
+                "topics": [
+                    {
+                        "title": "间隔复习",
+                        "focus": "学习方法",
+                        "suggested_path": "个人成长/间隔复习.md",
+                        "aliases": [],
+                        "summary": "",
+                        "candidate_paths": [],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    value = _chat_json(
+        [{"role": "user", "content": "测试"}],
+        settings,
+        "知识路由",
+        max_tokens=8000,
+        chat_func=fake_chat,
+    )
+
+    assert value["topics"][0]["title"] == "间隔复习"
+    assert len(calls) == 2
+    assert calls[1][-1]["role"] == "user"
+    assert "不是有效的 JSON" in calls[1][-1]["content"]
+
+
+def test_chat_json_retries_once_when_required_array_has_wrong_type(settings):
+    from app.knowledge import _chat_json
+
+    responses = iter(
+        [
+            '{"topics": null}',
+            '{"topics": []}',
+        ]
+    )
+    calls = []
+
+    def fake_chat(messages, settings, **kwargs):
+        calls.append(messages)
+        return next(responses)
+
+    value = _chat_json(
+        [{"role": "user", "content": "测试"}],
+        settings,
+        "知识路由",
+        max_tokens=8000,
+        chat_func=fake_chat,
+        required_array_field="topics",
+    )
+
+    assert value == {"topics": []}
+    assert len(calls) == 2
+    assert '以 "topics" 为唯一顶层字段' in calls[1][-1]["content"]
+    assert "topics 必须是数组" in calls[1][-1]["content"]
+
+
+def test_each_knowledge_stage_receives_only_its_own_schema():
+    from app.knowledge import _schema_protocol
+
+    routing = _schema_protocol("Multi-topic routing response", "Batched update plan")
+    planning = _schema_protocol("Batched update plan")
+
+    assert '"topics"' in routing
+    assert '"updates"' not in routing
+    assert '"updates"' in planning
+    assert '"topics"' not in planning

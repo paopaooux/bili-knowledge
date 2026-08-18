@@ -19,14 +19,10 @@ from .database import Database, utcnow
 from .knowledge import organize_document
 from .prompting import render_prompt
 from .subtitles import normalize_segments, parse_subtitle
-from .utils import format_timestamp, safe_filename, timestamp_url
+from .utils import safe_filename
 
 logger = logging.getLogger("uvicorn.error")
 PROMPTS_DIR = Path(__file__).resolve().parents[1] / "prompts"
-TIME_RANGE_PATTERN = re.compile(
-    r"\[(?P<start>\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—]\s*"
-    r"(?P<end>\d{1,2}:\d{2}(?::\d{2})?)\](?!\()"
-)
 
 
 class Cancelled(RuntimeError):
@@ -46,6 +42,9 @@ class Pipeline:
     def __init__(self, db: Database, settings: Settings):
         self.db = db
         self.settings = settings
+        # Routing and organizing update a shared topic catalog and shared Markdown files.
+        # Keep this critical section serial while allowing all earlier stages to overlap.
+        self.knowledge_write_lock = threading.Lock()
 
     def _cancel_guard(self, job_id: str) -> None:
         job = self.db.one("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,))
@@ -395,66 +394,66 @@ class Pipeline:
         segments = _json_read(paths["transcript"])
         if not isinstance(segments, list) or not segments:
             raise RuntimeError("转写为空，无法生成知识稿")
-        chunks, current, size = [], [], 0
-        for segment in segments:
-            line = f"[{format_timestamp(segment['start'])}-{format_timestamp(segment['end'])}] {segment['text']}"
-            if current and size + len(line) > self.settings.transcript_chunk_chars:
-                chunks.append("\n".join(current))
-                current, size = [], 0
-            current.append(line)
-            size += len(line)
-        if current:
-            chunks.append("\n".join(current))
+        transcript = "\n".join(segment["text"] for segment in segments)
         logger.info(
-            "Generating knowledge draft job_id=%s part_id=%s segments=%d chunks=%d",
+            "Generating knowledge draft job_id=%s part_id=%s segments=%d transcript_chars=%d",
             job["id"],
             part["id"],
             len(segments),
-            len(chunks),
+            len(transcript),
         )
-        notes = []
-        for index, chunk in enumerate(chunks, 1):
-            self._cancel_guard(job["id"])
-            notes.append(
-                chat(
-                    [
-                        {
-                            "role": "system",
-                            "content": render_prompt(PROMPTS_DIR / "transcript-chunk-system.md"),
-                        },
-                        {
-                            "role": "user",
-                            "content": render_prompt(
-                                PROMPTS_DIR / "transcript-chunk-user.md",
-                                index=index,
-                                total=len(chunks),
-                                chunk=chunk,
-                            ),
-                        },
-                    ],
-                    self.settings,
-                )
-            )
-        response = chat(
-            [
-                {
-                    "role": "system",
-                    "content": render_prompt(PROMPTS_DIR / "knowledge-draft-system.md"),
-                },
-                {
-                    "role": "user",
-                    "content": render_prompt(
-                        PROMPTS_DIR / "knowledge-draft-user.md",
-                        notes="\n\n---\n\n".join(notes),
-                    ),
-                },
-            ],
-            self.settings,
-            max_tokens=5000,
-        )
-        title, body = self._parse_knowledge_draft(response, metadata=_json_read(paths["metadata"]))
-        body = self._link_evidence_timestamps(body, part["url"])
+        self._cancel_guard(job["id"])
         metadata = _json_read(paths["metadata"])
+        messages = [
+            {
+                "role": "system",
+                "content": render_prompt(PROMPTS_DIR / "knowledge-draft-system.md"),
+            },
+            {
+                "role": "user",
+                "content": render_prompt(
+                    PROMPTS_DIR / "knowledge-draft-user.md",
+                    transcript=transcript,
+                ),
+            },
+        ]
+        title, body = "", ""
+        last_error: RuntimeError | None = None
+        for attempt in range(2):
+            self._cancel_guard(job["id"])
+            response = chat(
+                messages,
+                self.settings,
+                max_tokens=self.settings.knowledge_draft_max_tokens,
+            )
+            try:
+                title, body = self._parse_knowledge_draft(response, metadata)
+                break
+            except RuntimeError as exc:
+                if "没有返回有效的 title/body JSON" not in str(exc):
+                    raise
+                last_error = exc
+                logger.warning(
+                    "Knowledge draft returned invalid JSON job_id=%s part_id=%s attempt=%d snippet=%r",
+                    job["id"],
+                    part["id"],
+                    attempt + 1,
+                    response[:120],
+                )
+                messages.append({"role": "assistant", "content": response[:4000]})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "刚才的输出不是有效的 JSON 对象。请只输出一个 JSON 对象："
+                            '{"title":"知识主题标题","body":"Markdown 正文"}，'
+                            "不要输出代码围栏、解释或任何其他内容。"
+                        ),
+                    }
+                )
+        else:
+            assert last_error is not None
+            raise last_error
         metadata["generated_at"] = utcnow()
         metadata["model"] = self.settings.llm_model
         _json_write(paths["metadata"], metadata)
@@ -469,7 +468,7 @@ class Pipeline:
             paths["document"],
         )
         self.db.save_artifact(job["id"], part["id"], "document", paths["document"])
-        summary = notes[0][:500] if notes else ""
+        summary = body[:500]
         self.db.execute(
             "UPDATE job_parts SET summary=? WHERE job_id=? AND part_id=?",
             (summary, job["id"], part["id"]),
@@ -477,32 +476,38 @@ class Pipeline:
         return "completed"
 
     @staticmethod
-    def _link_evidence_timestamps(body: str, source_url: str) -> str:
-        def seconds(value: str) -> int:
-            units = [int(item) for item in value.split(":")]
-            return units[-1] + units[-2] * 60 + (units[-3] * 3600 if len(units) == 3 else 0)
-
-        def replacement(match: re.Match[str]) -> str:
-            label = f"{match.group('start')}–{match.group('end')}"
-            return f"[{label}]({timestamp_url(source_url, seconds(match.group('start')))})"
-
-        return TIME_RANGE_PATTERN.sub(replacement, body)
-
-    @staticmethod
     def _parse_knowledge_draft(response: str, metadata: dict) -> tuple[str, str]:
         text = response.strip()
         if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+        # 优先按 JSON 解析：取第一个 { 到最后一个 } 之间的内容，容忍前后多余文字与重复键。
         start, end = text.find("{"), text.rfind("}")
-        try:
-            payload = json.loads(text[start : end + 1])
-            title = str(payload["title"]).strip()
-            body = str(payload["body"]).strip()
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("知识稿模型没有返回有效的 title/body JSON") from exc
+        if start >= 0 and end > start:
+            try:
+                payload = json.loads(text[start : end + 1])
+                title = str(payload.get("title") or "").strip()
+                body = str(payload.get("body") or "").strip()
+            except (json.JSONDecodeError, TypeError, ValueError):
+                payload = None
+            if payload is not None and (title or body):
+                return Pipeline._finish_knowledge_draft(title, body, metadata)
+        # 模型没有按 JSON 输出时，回退为 Markdown：第一个一级标题作为主题标题，其余为正文。
+        heading = re.search(r"(?m)^#\s+([^\n]+)", text)
+        if heading:
+            title = heading.group(1).strip()
+            body = text[heading.end() :].strip()
+            if title and body:
+                return Pipeline._finish_knowledge_draft(title, body, metadata)
+        raise RuntimeError("知识稿模型没有返回有效的 title/body JSON，输出开头为：" + text[:120])
+
+    @staticmethod
+    def _finish_knowledge_draft(title: str, body: str, metadata: dict) -> tuple[str, str]:
         if not title or "\n" in title or len(title) > 100:
             raise RuntimeError("知识稿标题为空、过长或包含换行")
-        video_titles = {str(metadata.get("title") or "").strip(), str(metadata.get("video_title") or "").strip()}
+        video_titles = {
+            str(metadata.get("title") or "").strip(),
+            str(metadata.get("video_title") or "").strip(),
+        }
         if title in video_titles:
             raise RuntimeError("知识稿模型照抄了视频标题，没有生成知识主题标题")
         if not body:
@@ -523,32 +528,35 @@ class Pipeline:
     def _organize(self, job: dict, part: dict, paths: dict[str, Path]) -> str:
         if not paths["document"].exists():
             raise RuntimeError("知识稿文件不存在，无法归档知识")
-        result = organize_document(
-            paths["document"],
-            self.settings,
-            profile=self.db.active_knowledge_profile(),
-        )
-        logger.info(
-            "Knowledge organized job_id=%s part_id=%s updates=%d targets=%s",
-            job["id"],
-            part["id"],
-            len(result["updates"]),
-            [update["plan"]["target_path"] for update in result["updates"]],
-        )
-        _json_write(paths["knowledge_update"], result)
-        self.db.save_artifact(job["id"], part["id"], "knowledge_update", paths["knowledge_update"])
-        for update in result["updates"]:
-            topic_path = Path(update["topic_path"])
-            relative_path = topic_path.relative_to(
-                self.settings.knowledge_base_dir / "topics"
-            ).as_posix()
-            self.db.save_topic_state(
-                relative_path,
-                job.get("bvid"),
-                update["plan"]["action"],
-                update["updated_at"],
+        with self.knowledge_write_lock:
+            result = organize_document(
+                paths["document"],
+                self.settings,
+                profile=self.db.active_knowledge_profile(),
             )
-            self.db.save_artifact(job["id"], part["id"], "topic", topic_path)
+            logger.info(
+                "Knowledge organized job_id=%s part_id=%s updates=%d targets=%s",
+                job["id"],
+                part["id"],
+                len(result["updates"]),
+                [update["plan"]["target_path"] for update in result["updates"]],
+            )
+            _json_write(paths["knowledge_update"], result)
+            self.db.save_artifact(
+                job["id"], part["id"], "knowledge_update", paths["knowledge_update"]
+            )
+            for update in result["updates"]:
+                topic_path = Path(update["topic_path"])
+                relative_path = topic_path.relative_to(
+                    self.settings.knowledge_base_dir / "topics"
+                ).as_posix()
+                self.db.save_topic_state(
+                    relative_path,
+                    job.get("bvid"),
+                    update["plan"]["action"],
+                    update["updated_at"],
+                )
+                self.db.save_artifact(job["id"], part["id"], "topic", topic_path)
         return "completed"
 
     @staticmethod
@@ -559,23 +567,39 @@ class Pipeline:
 
 
 class JobWorker:
-    def __init__(self, pipeline: Pipeline):
+    def __init__(self, pipeline: Pipeline, concurrency: int = 8):
         self.pipeline = pipeline
-        self.queue: Queue[str | None] = Queue()
-        self.thread: threading.Thread | None = None
+        self.queue: Queue[str | tuple[str, ...] | None] = Queue()
+        self.concurrency = max(1, min(32, int(concurrency)))
+        self.threads: list[threading.Thread] = []
         self._queued: set[str] = set()
         self._lock = threading.Lock()
 
     def start(self) -> None:
-        if self.thread and self.thread.is_alive():
-            return
-        self.thread = threading.Thread(target=self._loop, name="job-worker", daemon=True)
-        self.thread.start()
+        with self._lock:
+            if any(thread.is_alive() for thread in self.threads):
+                return
+            self.threads = [
+                threading.Thread(
+                    target=self._loop,
+                    name=f"job-worker-{index + 1}",
+                    daemon=True,
+                )
+                for index in range(self.concurrency)
+            ]
+            for thread in self.threads:
+                thread.start()
 
     def stop(self) -> None:
-        if self.thread and self.thread.is_alive():
+        threads = [thread for thread in self.threads if thread.is_alive()]
+        for _ in threads:
             self.queue.put(None)
-            self.thread.join(timeout=5)
+        for thread in threads:
+            thread.join(timeout=5)
+
+    @property
+    def alive_count(self) -> int:
+        return sum(thread.is_alive() for thread in self.threads)
 
     def enqueue(self, job_id: str) -> None:
         with self._lock:
@@ -584,15 +608,32 @@ class JobWorker:
             self._queued.add(job_id)
             self.queue.put(job_id)
 
+    def enqueue_serial(self, job_ids: list[str]) -> None:
+        """Run an ordered maintenance batch in one worker instead of spreading it across the pool."""
+        with self._lock:
+            pending = tuple(job_id for job_id in dict.fromkeys(job_ids) if job_id not in self._queued)
+            if not pending:
+                return
+            self._queued.update(pending)
+            self.queue.put(pending)
+
     def _loop(self) -> None:
         while True:
             job_id = self.queue.get()
             if job_id is None:
                 self.queue.task_done()
                 return
+            job_ids = job_id if isinstance(job_id, tuple) else (job_id,)
             try:
-                self.pipeline.run(job_id)
+                for current_job_id in job_ids:
+                    try:
+                        self.pipeline.run(current_job_id)
+                    except Exception:
+                        # Pipeline.run normally records failures itself. Keep a worker alive if
+                        # an unexpected error escapes so the rest of the queue is still serviced.
+                        logger.exception("Unhandled worker error job_id=%s", current_job_id)
+                    finally:
+                        with self._lock:
+                            self._queued.discard(current_job_id)
             finally:
-                with self._lock:
-                    self._queued.discard(job_id)
                 self.queue.task_done()

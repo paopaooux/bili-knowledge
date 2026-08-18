@@ -41,9 +41,11 @@ export interface Job {
   id: string
   video_title: string
   bvid: string
+  video_url?: string
   status: Status
   error?: string
   created_at: string
+  updated_at?: string
   parts: JobPart[]
   artifacts: Artifact[]
 }

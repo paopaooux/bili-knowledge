@@ -45,7 +45,7 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
     db = Database(config.database_path)
     db.migrate()
     db.seed_knowledge_profile(load_knowledge_profile(config.knowledge_profile_path))
-    worker = JobWorker(Pipeline(db, config))
+    worker = JobWorker(Pipeline(db, config), concurrency=config.job_worker_concurrency)
 
     def prepare_profile(request: KnowledgeProfileRequest) -> dict:
         raw = request.model_dump()
@@ -87,7 +87,9 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
     def health() -> dict:
         return {
             "ok": True,
-            "worker": "running" if worker.thread and worker.thread.is_alive() else "stopped",
+            "worker": "running" if worker.alive_count else "stopped",
+            "worker_concurrency": worker.concurrency,
+            "active_workers": worker.alive_count,
         }
 
     @app.post("/api/videos/inspect")
@@ -116,7 +118,12 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
         )
         if len(parts) != len(unique_ids):
             raise HTTPException(status_code=422, detail="包含不属于该视频的分 P")
-        job_id = db.create_job(request.video_id, unique_ids)
+        job_id, created = db.create_job_if_absent(request.video_id, unique_ids)
+        if not created:
+            raise HTTPException(
+                status_code=409,
+                detail="相同视频任务已存在，请在历史任务中查看；失败任务可直接重试",
+            )
         if start_worker:
             worker.enqueue(job_id)
         return db.job_detail(job_id)
@@ -131,6 +138,81 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
         if not job:
             raise HTTPException(status_code=404, detail="任务不存在")
         return job
+
+    @app.post("/api/knowledge/regenerate")
+    def regenerate_knowledge_base() -> dict:
+        active_jobs = db.one(
+            "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('queued','running')"
+        )["count"]
+        if active_jobs:
+            raise HTTPException(
+                status_code=409,
+                detail="仍有任务正在排队或处理，请等待全部结束后再重新生成知识库",
+            )
+
+        eligible_parts: list[tuple[str, str]] = []
+        generated_paths: set[Path] = set()
+        jobs_to_queue: list[str] = []
+        # Process old jobs first so the rebuilt topics evolve in their original order.
+        for job in sorted(db.list_jobs(), key=lambda item: (item["created_at"], item["id"])):
+            for part in job["parts"]:
+                paths = worker.pipeline._paths(job, part)
+                if paths["transcript"].is_file() and paths["metadata"].is_file():
+                    eligible_parts.append((job["id"], part["id"]))
+                    if job["id"] not in jobs_to_queue:
+                        jobs_to_queue.append(job["id"])
+                for artifact in part["artifacts"]:
+                    if artifact["kind"] in {"document", "knowledge_update", "index"}:
+                        generated_paths.add(Path(artifact["path"]))
+
+        if not eligible_parts:
+            raise HTTPException(
+                status_code=409,
+                detail="没有可重新生成的历史任务；至少需要保留完整的转写和元数据",
+            )
+
+        for path in generated_paths:
+            if within_directory(path, config.source_output_dir) or within_directory(
+                path, config.knowledge_base_dir
+            ):
+                with suppress(OSError):
+                    path.unlink(missing_ok=True)
+        topics_directory = config.knowledge_base_dir / "topics"
+        shutil.rmtree(topics_directory, ignore_errors=True)
+        topics_directory.mkdir(parents=True, exist_ok=True)
+
+        now = utcnow()
+        with db.transaction() as connection:
+            connection.execute(
+                "DELETE FROM artifacts WHERE kind IN ('document','topic','knowledge_update','index')"
+            )
+            connection.execute("DELETE FROM knowledge_topics")
+            for job_id, part_id in eligible_parts:
+                connection.execute(
+                    """UPDATE job_stages SET status='pending',error=NULL,started_at=NULL,
+                    finished_at=NULL,retries=retries+CASE WHEN stage='generate' THEN 1 ELSE 0 END
+                    WHERE job_id=? AND part_id=? AND stage IN ('generate','organize','publish')""",
+                    (job_id, part_id),
+                )
+                connection.execute(
+                    "UPDATE job_parts SET status='queued',summary=NULL WHERE job_id=? AND part_id=?",
+                    (job_id, part_id),
+                )
+            for job_id in jobs_to_queue:
+                connection.execute(
+                    """UPDATE jobs SET status='queued',cancel_requested=0,error=NULL,
+                    completed_at=NULL,updated_at=? WHERE id=?""",
+                    (now, job_id),
+                )
+
+        if start_worker:
+            worker.enqueue_serial(jobs_to_queue)
+        logger.info(
+            "Knowledge base regeneration queued jobs=%d parts=%d",
+            len(jobs_to_queue),
+            len(eligible_parts),
+        )
+        return {"queued_jobs": len(jobs_to_queue), "queued_parts": len(eligible_parts)}
 
     @app.post("/api/jobs/{job_id}/retry")
     def retry(job_id: str, request: RetryRequest) -> dict:
@@ -187,7 +269,7 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
         return {"ok": True, "message": "已请求取消；当前网络或转码操作结束后生效"}
 
     @app.delete("/api/jobs/{job_id}", status_code=204)
-    def delete_failed_job(job_id: str) -> None:
+    def delete_finished_job(job_id: str) -> None:
         removable_kinds = {"metadata", "transcript", "audio_temp", "knowledge_update"}
         removable_paths: list[Path] = []
         with db.transaction() as connection:
@@ -195,15 +277,15 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
             job = connection.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not job:
                 raise HTTPException(status_code=404, detail="任务不存在")
-            if job["status"] != "failed":
-                raise HTTPException(status_code=409, detail="只能删除失败的任务")
+            if job["status"] not in {"failed", "cancelled"}:
+                raise HTTPException(status_code=409, detail="只能删除失败或已取消的任务")
             artifacts = connection.execute(
                 "SELECT kind,path FROM artifacts WHERE job_id=?", (job_id,)
             ).fetchall()
             if any(item["kind"] in {"document", "topic", "index"} for item in artifacts):
                 raise HTTPException(
                     status_code=409,
-                    detail="该任务已经生成知识文档或写入主题知识，不能作为空失败任务删除",
+                    detail="该任务已经生成知识文档或写入主题知识，不能删除任务记录",
                 )
             for artifact in artifacts:
                 if artifact["kind"] not in removable_kinds:
@@ -228,11 +310,16 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
             ):
                 with suppress(OSError):
                     path.unlink(missing_ok=True)
-        logger.info("Deleted failed job %s; remaining jobs: %s", job_id, jobs_after)
+        logger.info("Deleted failed or cancelled job %s; remaining jobs: %s", job_id, jobs_after)
 
     def document_artifact(artifact_id: str) -> tuple[dict, Path]:
         artifact = db.one("SELECT * FROM artifacts WHERE id=?", (artifact_id,))
-        if not artifact or artifact["kind"] not in {"document", "index", "topic"}:
+        if not artifact or artifact["kind"] not in {
+            "document",
+            "index",
+            "topic",
+            "knowledge_update",
+        }:
             raise HTTPException(status_code=404, detail="文档不存在")
         path = Path(artifact["path"])
         if not (
@@ -394,7 +481,8 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
         if file_path.suffix.lower() not in {".md", ".markdown"}:
             raise HTTPException(status_code=415, detail="只能重构 Markdown 主题")
         try:
-            return refactor_topic_document(file_path, config)
+            with worker.pipeline.knowledge_write_lock:
+                return refactor_topic_document(file_path, config)
         except (KnowledgeOrganizerError, AIServiceError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -466,7 +554,7 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
                     },
                 ],
                 config,
-                max_tokens=500,
+                max_tokens=2000,
             )
             start, end = response.find("{"), response.rfind("}")
             suggestion = json.loads(response[start : end + 1])

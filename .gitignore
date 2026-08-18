@@ -11,7 +11,13 @@ frontend/dist/
 frontend/vite.config.js
 frontend/vite.config.d.ts
 *.tsbuildinfo
+android/.gradle/
+android/local.properties
+android/**/build/
+*.apk
 data/
 source-output/
 knowledge-base/
 *.sqlite3
+migration-backups/
+pre-restore-data/
