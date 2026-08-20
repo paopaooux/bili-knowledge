@@ -12,7 +12,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN sed -i 's|deb.debian.org/debian|mirrors.aliyun.com/debian|g; s|deb.debian.org/debian-security|mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::ForceIPv4=true update \
-    && apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends bash ca-certificates ffmpeg nginx \
+    && apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends bash ca-certificates ffmpeg nginx fonts-wqy-zenhei \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /etc/nginx/sites-enabled/default
 

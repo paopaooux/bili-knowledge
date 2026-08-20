@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
+import re
+from urllib.parse import quote
 import logging
 import shutil
 from contextlib import asynccontextmanager, suppress
@@ -9,7 +12,10 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen.canvas import Canvas
 
 from .ai import AIServiceError, chat, test_service
 from .config import Settings, load_settings
@@ -131,8 +137,8 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
         return db.job_detail(job_id)
 
     @app.get("/api/jobs")
-    def jobs() -> list[dict]:
-        return db.list_jobs()
+    def jobs(compact: bool = False) -> list[dict]:
+        return db.list_jobs_compact() if compact else db.list_jobs()
 
     @app.get("/api/jobs/{job_id}")
     def job_detail(job_id: str) -> dict:
@@ -476,6 +482,36 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
     def download_knowledge_file(path: str) -> FileResponse:
         file_path = knowledge_file(path)
         return FileResponse(file_path, filename=file_path.name)
+
+    @app.get("/api/knowledge/file/pdf")
+    def export_knowledge_pdf(path: str) -> Response:
+        file_path = knowledge_file(path)
+        if file_path.suffix.lower() not in {".md", ".markdown", ".txt"}:
+            raise HTTPException(status_code=415, detail="该文件类型不支持导出 PDF")
+        font_path = "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"
+        pdfmetrics.registerFont(TTFont("WQY", font_path))
+        output = io.BytesIO(); document = Canvas(output, pagesize=(595, 842)); document.setFont("WQY", 11)
+        y = 800
+        for raw in file_path.read_text(encoding="utf-8").splitlines():
+            heading = len(raw) - len(raw.lstrip("#")) if raw.lstrip().startswith("#") else 0
+            line = raw.lstrip("# ") if heading else raw
+            line = re.sub(r"`([^`]*)`", r"\1", line)
+            for chunk in (line[index:index + 42] for index in range(0, max(len(line), 1), 42)):
+                if y < 40: document.showPage(); document.setFont("WQY", 11); y = 800
+                x = 42
+                for part in re.split(r"(\*\*.*?\*\*|__.*?__)", chunk):
+                    if not part: continue
+                    bold = (part.startswith("**") and part.endswith("**")) or (part.startswith("__") and part.endswith("__"))
+                    visible = part[2:-2] if bold else part
+                    if heading >= 2: document.setFont("WQY", 14 if heading == 2 else 12)
+                    document.drawString(x, y, visible)
+                    if bold: document.drawString(x + 0.35, y, visible)
+                    x += pdfmetrics.stringWidth(visible, "WQY", 14 if heading == 2 else 12 if heading >= 3 else 11)
+                document.setFont("WQY", 11); y -= 20 if heading else 18
+        document.save()
+        filename = f"{file_path.stem}.pdf"
+        disposition = f"attachment; filename=knowledge.pdf; filename*=UTF-8''{quote(filename)}"
+        return Response(output.getvalue(), media_type="application/pdf", headers={"Content-Disposition": disposition})
 
     @app.post("/api/knowledge/file/refactor", response_class=PlainTextResponse)
     def refactor_knowledge_file(path: str) -> str:

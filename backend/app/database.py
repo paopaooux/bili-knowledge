@@ -480,8 +480,88 @@ class Database:
         return job
 
     def list_jobs(self) -> list[dict]:
-        rows = self.all("SELECT id FROM jobs ORDER BY updated_at DESC,created_at DESC,id DESC")
-        return [detail for row in rows if (detail := self.job_detail(row["id"]))]
+        # Keep this endpoint cheap because both clients poll it. The previous implementation
+        # called job_detail() for every row (four SQL queries per job), which became noticeably
+        # slower as history grew.
+        jobs = self.all(
+            """SELECT j.*,v.title AS video_title,v.bvid,v.url AS video_url
+            FROM jobs j JOIN videos v ON v.id=j.video_id
+            ORDER BY j.updated_at DESC,j.created_at DESC,j.id DESC"""
+        )
+        if not jobs:
+            return []
+        parts = self.all(
+            """SELECT jp.job_id,p.*,jp.status,jp.summary FROM job_parts jp
+            JOIN parts p ON p.id=jp.part_id ORDER BY jp.job_id,p.part_index"""
+        )
+        stages = self.all(
+            "SELECT * FROM job_stages ORDER BY job_id,part_id,id"
+        )
+        artifacts = self.all(
+            "SELECT * FROM artifacts ORDER BY job_id,created_at"
+        )
+        parts_by_job: dict[str, list[dict]] = {}
+        stages_by_part: dict[tuple[str, str], list[dict]] = {}
+        artifacts_by_part: dict[tuple[str, str | None], list[dict]] = {}
+        for part in parts:
+            parts_by_job.setdefault(part["job_id"], []).append(part)
+        for stage in stages:
+            stages_by_part.setdefault((stage["job_id"], stage["part_id"]), []).append(stage)
+        for artifact in artifacts:
+            artifacts_by_part.setdefault(
+                (artifact["job_id"], artifact["part_id"]), []
+            ).append(artifact)
+        for job in jobs:
+            job_parts = parts_by_job.get(job["id"], [])
+            for part in job_parts:
+                part["stages"] = sorted(
+                    stages_by_part.get((job["id"], part["id"]), []),
+                    key=lambda stage: STAGES.index(stage["stage"]),
+                )
+                part["artifacts"] = artifacts_by_part.get((job["id"], part["id"]), [])
+                part.pop("subtitle_json", None)
+                part.pop("raw_json", None)
+            job["parts"] = job_parts
+            job["artifacts"] = artifacts_by_part.get((job["id"], None), [])
+            job["cancel_requested"] = bool(job["cancel_requested"])
+        return jobs
+
+    def list_jobs_compact(self) -> list[dict]:
+        """Return only the fields needed by polling clients such as the Android app."""
+        jobs = self.all(
+            """SELECT j.id,j.status,j.error,j.created_at,j.updated_at,j.cancel_requested,
+            v.title AS video_title,v.bvid,v.url AS video_url
+            FROM jobs j JOIN videos v ON v.id=j.video_id
+            ORDER BY j.updated_at DESC,j.created_at DESC,j.id DESC"""
+        )
+        if not jobs:
+            return []
+        parts = self.all(
+            """SELECT jp.job_id,p.id,p.title,jp.status FROM job_parts jp
+            JOIN parts p ON p.id=jp.part_id ORDER BY jp.job_id,p.part_index"""
+        )
+        stages = self.all(
+            """SELECT job_id,part_id,stage,status,error FROM job_stages
+            ORDER BY job_id,part_id,id"""
+        )
+        parts_by_job: dict[str, list[dict]] = {}
+        stages_by_part: dict[tuple[str, str], list[dict]] = {}
+        for part in parts:
+            parts_by_job.setdefault(part.pop("job_id"), []).append(part)
+        for stage in stages:
+            job_id = stage.pop("job_id")
+            part_id = stage.pop("part_id")
+            stages_by_part.setdefault((job_id, part_id), []).append(stage)
+        for job in jobs:
+            job_parts = parts_by_job.get(job["id"], [])
+            for part in job_parts:
+                part["stages"] = sorted(
+                    stages_by_part.get((job["id"], part["id"]), []),
+                    key=lambda stage: STAGES.index(stage["stage"]),
+                )
+            job["parts"] = job_parts
+            job["cancel_requested"] = bool(job["cancel_requested"])
+        return jobs
 
     def recover_interrupted(self) -> list[str]:
         with self.transaction() as connection:

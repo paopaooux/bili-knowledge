@@ -8,6 +8,7 @@ import subprocess
 import threading
 from pathlib import Path
 from queue import Queue
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import yt_dlp
@@ -20,6 +21,7 @@ from .knowledge import organize_document
 from .prompting import render_prompt
 from .subtitles import normalize_segments, parse_subtitle
 from .utils import safe_filename
+from .video import BROWSER_HEADERS, BVID_PATTERN
 
 logger = logging.getLogger("uvicorn.error")
 PROMPTS_DIR = Path(__file__).resolve().parents[1] / "prompts"
@@ -228,20 +230,89 @@ class Pipeline:
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "96"}
             ],
+            "http_headers": BROWSER_HEADERS,
         }
         if self.settings.cookie_file:
             options["cookiefile"] = str(self.settings.cookie_file)
         try:
             with yt_dlp.YoutubeDL(options) as downloader:
                 downloader.download([url])
-        except Exception as exc:
-            raise RuntimeError(f"字幕不可用且音频下载失败：{exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - yt-dlp extractors raise varied exceptions
+            try:
+                self._download_audio_via_api(url, destination)
+            except (httpx.HTTPError, ValueError, KeyError, RuntimeError, OSError) as fallback_exc:
+                raise RuntimeError(
+                    f"字幕不可用且音频下载失败：{exc}；API 备用下载也失败：{fallback_exc}"
+                ) from exc
         if not destination.exists():
             matches = list(destination.parent.glob("audio*.mp3"))
             if matches:
                 matches[0].replace(destination)
         if not destination.exists():
             raise RuntimeError("音频下载完成但未找到输出文件，请检查 ffmpeg")
+
+    def _download_audio_via_api(self, url: str, destination: Path) -> None:
+        match = BVID_PATTERN.search(url)
+        if not match:
+            raise RuntimeError("来源链接缺少 BV 号")
+        bvid = "BV" + match.group(0)[2:]
+        page_number = int((parse_qs(urlparse(url).query).get("p") or ["1"])[0])
+        with httpx.Client(headers=BROWSER_HEADERS, timeout=30) as client:
+            view = client.get(
+                "https://api.bilibili.com/x/web-interface/view", params={"bvid": bvid}
+            )
+            view.raise_for_status()
+            view_payload = view.json()
+            pages = (view_payload.get("data") or {}).get("pages") or []
+            page = next(
+                (item for item in pages if int(item.get("page") or 0) == page_number), None
+            )
+            if not page:
+                raise RuntimeError("Bilibili API 未返回对应分 P")
+            play = client.get(
+                "https://api.bilibili.com/x/player/playurl",
+                params={"bvid": bvid, "cid": page["cid"], "fnval": 16, "qn": 64},
+            )
+            play.raise_for_status()
+            play_payload = play.json()
+            audio_streams = ((play_payload.get("data") or {}).get("dash") or {}).get("audio") or []
+            if play_payload.get("code") != 0 or not audio_streams:
+                raise RuntimeError(play_payload.get("message") or "Bilibili API 未返回音频流")
+            stream = max(audio_streams, key=lambda item: item.get("bandwidth") or 0)
+            candidates = [stream.get("baseUrl") or stream.get("base_url")]
+            candidates.extend(stream.get("backupUrl") or stream.get("backup_url") or [])
+            source = destination.with_suffix(".m4s")
+            download_error: Exception | None = None
+            for candidate in filter(None, candidates):
+                try:
+                    with client.stream(
+                        "GET",
+                        candidate,
+                        headers={"Referer": f"https://www.bilibili.com/video/{bvid}"},
+                    ) as response:
+                        response.raise_for_status()
+                        with source.open("wb") as handle:
+                            for chunk in response.iter_bytes():
+                                handle.write(chunk)
+                    break
+                except httpx.HTTPError as exc:
+                    download_error = exc
+            else:
+                raise RuntimeError(f"Bilibili 音频流不可下载：{download_error}")
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(source), "-vn", "-codec:a", "libmp3lame",
+                    "-b:a", "96k", str(destination),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip()[-500:] or "ffmpeg 转换失败")
+        finally:
+            source.unlink(missing_ok=True)
 
     def _transcribe(self, job: dict, part: dict, paths: dict[str, Path]) -> str:
         if paths["transcript"].exists() and _json_read(paths["transcript"]):

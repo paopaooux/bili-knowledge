@@ -46,6 +46,49 @@ def test_jobs_are_ordered_by_last_update(settings):
     assert [job["id"] for job in db.list_jobs()] == [older, newer]
 
 
+def test_list_jobs_uses_fixed_number_of_bulk_queries(settings, monkeypatch):
+    db = Database(settings.database_path)
+    db.migrate()
+    video = db.save_inspection(inspection())
+    for part in video["parts"]:
+        db.create_job(video["id"], [part["id"]])
+    original_all = db.all
+    queries = []
+
+    def tracked_all(sql, params=()):
+        queries.append(sql)
+        return original_all(sql, params)
+
+    monkeypatch.setattr(db, "all", tracked_all)
+
+    jobs = db.list_jobs()
+
+    assert len(jobs) == 2
+    assert len(queries) == 4
+    assert all(job["parts"][0]["stages"] for job in jobs)
+
+
+def test_compact_job_list_omits_artifacts_and_uses_three_queries(settings, monkeypatch):
+    db = Database(settings.database_path)
+    db.migrate()
+    video = db.save_inspection(inspection())
+    db.create_job(video["id"], [video["parts"][0]["id"]])
+    original_all = db.all
+    queries = []
+
+    def tracked_all(sql, params=()):
+        queries.append(sql)
+        return original_all(sql, params)
+
+    monkeypatch.setattr(db, "all", tracked_all)
+    jobs = db.list_jobs_compact()
+
+    assert len(queries) == 3
+    assert "artifacts" not in jobs[0]
+    assert "artifacts" not in jobs[0]["parts"][0]
+    assert "summary" not in jobs[0]["parts"][0]
+
+
 def test_migration_is_idempotent(settings):
     db = Database(settings.database_path)
     db.migrate()

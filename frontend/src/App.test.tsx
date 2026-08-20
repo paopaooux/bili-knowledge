@@ -100,8 +100,8 @@ test('browses the knowledge directory and previews markdown in the page', async 
   expect(summary.closest('details')).not.toHaveAttribute('open')
   fireEvent.click(summary)
   expect(screen.getByText('条件：已经理解材料。')).toBeInTheDocument()
-  expect(screen.getByRole('link', { name: '下载' })).toHaveAttribute(
-    'href', '/api/knowledge/file/download?path=topics%2F%E5%AD%A6%E4%B9%A0%E6%96%B9%E6%B3%95.md',
+  expect(screen.getByRole('link', { name: '导出 PDF' })).toHaveAttribute(
+    'href', '/api/knowledge/file/pdf?path=topics%2F%E5%AD%A6%E4%B9%A0%E6%96%B9%E6%B3%95.md',
   )
 })
 

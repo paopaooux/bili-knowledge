@@ -1,18 +1,45 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
+import httpx
 import yt_dlp
 
 from .config import Settings
 
 BVID_PATTERN = re.compile(r"BV[0-9A-Za-z]{10}", re.IGNORECASE)
 SHORT_LINK_HOSTS = {"b23.tv", "www.b23.tv"}
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://www.bilibili.com/",
+}
 
 
 class VideoInspectionError(RuntimeError):
     pass
+
+
+def _resolve_short_link(url: str) -> str:
+    try:
+        # Read the shortener redirect itself, but do not request the destination page. Bilibili
+        # may return 412 for that second request from a cloud IP even though the short link is
+        # valid; the Location header already contains everything needed here.
+        with httpx.Client(headers=BROWSER_HEADERS, follow_redirects=False, timeout=15) as client:
+            response = client.get(url)
+            if response.is_error:
+                response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise VideoInspectionError("b23.tv 短链访问失败，请稍后重试或粘贴完整 BV 链接") from exc
+    resolved = response.headers.get("location", str(response.url))
+    match = BVID_PATTERN.search(resolved)
+    if not match:
+        # Invalid/expired short codes commonly return a small JSON error body with HTTP 200.
+        raise VideoInspectionError(
+            "b23.tv 短链无效或已过期，请检查大小写以及数字 0、字母 O 是否输入正确"
+        )
+    return f"https://www.bilibili.com/video/BV{match.group(0)[2:]}"
 
 
 def _part_url(base_url: str, index: int) -> str:
@@ -73,17 +100,79 @@ def _resolved_bvid(info: dict, entries: list[dict]) -> str | None:
     return None
 
 
+def _api_video_info(bvid: str) -> dict:
+    """Fetch public metadata without loading the video webpage blocked on some cloud IPs."""
+    with httpx.Client(headers=BROWSER_HEADERS, timeout=15) as client:
+        response = client.get(
+            "https://api.bilibili.com/x/web-interface/view", params={"bvid": bvid}
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") or {}
+        if payload.get("code") != 0 or not data:
+            raise VideoInspectionError(payload.get("message") or "Bilibili 视频信息不可用")
+        entries = []
+        for page in data.get("pages") or []:
+            cid = page.get("cid")
+            subtitles: dict[str, list[dict]] = {}
+            if cid:
+                player = client.get(
+                    "https://api.bilibili.com/x/player/v2",
+                    params={"bvid": bvid, "cid": cid},
+                )
+                if player.is_success:
+                    for item in (
+                        (player.json().get("data") or {}).get("subtitle", {}).get("subtitles")
+                        or []
+                    ):
+                        subtitle_url = item.get("subtitle_url")
+                        if subtitle_url:
+                            language = item.get("lan") or "unknown"
+                            subtitles.setdefault(language, []).append(
+                                {"url": subtitle_url, "ext": "json"}
+                            )
+            entries.append(
+                {
+                    "id": str(cid or ""),
+                    "cid": cid,
+                    "page": page.get("page"),
+                    "playlist_index": page.get("page"),
+                    "title": page.get("part") or data.get("title"),
+                    "duration": page.get("duration"),
+                    "subtitles": subtitles,
+                }
+            )
+        published = data.get("pubdate")
+        return {
+            "id": bvid,
+            "title": data.get("title") or bvid,
+            "uploader": (data.get("owner") or {}).get("name"),
+            "thumbnail": data.get("pic"),
+            "duration": data.get("duration"),
+            "upload_date": (
+                datetime.fromtimestamp(published, UTC).strftime("%Y%m%d")
+                if published
+                else None
+            ),
+            "extractor": "bilibili_api",
+            "entries": entries,
+        }
+
+
 def inspect_video(url: str, settings: Settings) -> dict:
     match = BVID_PATTERN.search(url)
     hostname = (urlparse(url).hostname or "").lower().rstrip(".")
     if not match and hostname not in SHORT_LINK_HOSTS:
         raise VideoInspectionError("仅支持含 BV 号的 Bilibili 视频链接或 b23.tv 官方短链")
+    inspection_url = _resolve_short_link(url) if hostname in SHORT_LINK_HOSTS else url
+    match = BVID_PATTERN.search(inspection_url)
     options = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "extract_flat": False,
         "ignoreconfig": True,
+        "http_headers": BROWSER_HEADERS,
     }
     if settings.cookie_file:
         if not settings.cookie_file.is_file():
@@ -91,10 +180,13 @@ def inspect_video(url: str, settings: Settings) -> dict:
         options["cookiefile"] = str(settings.cookie_file)
     try:
         with yt_dlp.YoutubeDL(options) as downloader:
-            info = downloader.extract_info(url, download=False)
-    except Exception as exc:
-        message = str(exc).replace("ERROR: ", "")
-        raise VideoInspectionError(f"视频解析失败：{message}") from exc
+            info = downloader.extract_info(inspection_url, download=False)
+    except Exception as exc:  # noqa: BLE001 - yt-dlp extractors raise varied exceptions
+        try:
+            info = _api_video_info("BV" + match.group(0)[2:])
+        except (httpx.HTTPError, ValueError, VideoInspectionError, KeyError, TypeError):
+            message = str(exc).replace("ERROR: ", "")
+            raise VideoInspectionError(f"视频解析失败：{message}") from exc
     if not info:
         raise VideoInspectionError("视频解析没有返回信息")
 

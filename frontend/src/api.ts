@@ -44,8 +44,8 @@ export const api = {
   knowledgeFiles: () => request<KnowledgeFile[]>('/api/knowledge/files'),
   regenerateKnowledge: () => request<{ queued_jobs: number; queued_parts: number }>('/api/knowledge/regenerate', { method: 'POST' }),
   knowledgeFile: (path: string) => request<string>(`/api/knowledge/file?path=${encodeURIComponent(path)}`),
+  knowledgePdfUrl: (path: string) => `/api/knowledge/file/pdf?path=${encodeURIComponent(path)}`,
   refactorKnowledgeFile: (path: string) => request<string>(`/api/knowledge/file/refactor?path=${encodeURIComponent(path)}`, { method: 'POST' }),
-  knowledgeDownloadUrl: (path: string) => `/api/knowledge/file/download?path=${encodeURIComponent(path)}`,
   profiles: () => request<KnowledgeProfile[]>('/api/knowledge/profiles'),
   createProfile: (profile: KnowledgeProfile) => request<KnowledgeProfile>('/api/knowledge/profiles', {
     method: 'POST', body: JSON.stringify(profile),

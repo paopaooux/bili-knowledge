@@ -15,6 +15,7 @@ dependencies = [
   "oss2>=2.19,<3",
   "python-multipart>=0.0.9,<1",
   "yt-dlp>=2025.1.0",
+  "reportlab>=4.2,<5",
 ]
 
 [project.optional-dependencies]

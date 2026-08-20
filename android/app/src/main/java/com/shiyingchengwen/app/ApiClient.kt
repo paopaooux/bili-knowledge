@@ -34,6 +34,7 @@ class ApiClient(private val baseUrl: String) {
             bvid = value.getString("bvid"),
             title = value.getString("title"),
             uploader = value.optNullableString("uploader"),
+            coverUrl = value.optNullableString("cover_url"),
             partId = parts.getJSONObject(0).getString("id"),
         )
     }
@@ -48,9 +49,16 @@ class ApiClient(private val baseUrl: String) {
         parser = ::parseJob,
     )
 
-    suspend fun jobs(): List<Job> = arrayRequest("/api/jobs") { array ->
+    suspend fun jobs(): List<Job> = arrayRequest("/api/jobs?compact=true") { array ->
         List(array.length()) { parseJob(array.getJSONObject(it)) }
     }
+
+    suspend fun retry(jobId: String, partId: String, stage: String): Job = objectRequest(
+        "/api/jobs/$jobId/retry",
+        method = "POST",
+        body = JSONObject().put("part_id", partId).put("stage", stage).toString(),
+        parser = ::parseJob,
+    )
 
     suspend fun knowledgeFiles(): List<KnowledgeEntry> = arrayRequest("/api/knowledge/files") {
         array -> List(array.length()) { parseKnowledgeEntry(array.getJSONObject(it)) }
@@ -61,6 +69,13 @@ class ApiClient(private val baseUrl: String) {
             .addQueryParameter("path", path)
             .build()
         return execute(Request.Builder().url(url).get().build())
+    }
+
+    suspend fun refactorKnowledgeFile(path: String): String {
+        val url = (baseUrl + "/api/knowledge/file/refactor").toHttpUrl().newBuilder()
+            .addQueryParameter("path", path)
+            .build()
+        return execute(Request.Builder().url(url).post("{}".toRequestBody(jsonType)).build())
     }
 
     private suspend fun <T> objectRequest(
@@ -110,6 +125,7 @@ class ApiClient(private val baseUrl: String) {
                 val part = parts.getJSONObject(index)
                 val stages = part.optJSONArray("stages") ?: JSONArray()
                 JobPart(
+                    id = part.getString("id"),
                     title = part.getString("title"),
                     status = part.getString("status"),
                     stages = List(stages.length()) { stageIndex ->

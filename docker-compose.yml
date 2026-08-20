@@ -16,7 +16,7 @@ services:
       BACKEND_HOST: 127.0.0.1
       BACKEND_PORT: 8000
     ports:
-      - "127.0.0.1:5175:8080"
+      - "0.0.0.0:5175:8080"
     volumes:
       - ./data:/app/data
       - ./source-output:/app/source-output
