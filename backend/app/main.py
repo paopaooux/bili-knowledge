@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import io
 import json
-import re
-from urllib.parse import quote
 import logging
+import re
 import shutil
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,7 +52,21 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
     configure_runtime_logging(config)
     db = Database(config.database_path)
     db.migrate()
-    db.seed_knowledge_profile(load_knowledge_profile(config.knowledge_profile_path))
+    initial_profile = db.seed_knowledge_profile(
+        load_knowledge_profile(config.knowledge_profile_path)
+    )
+    db.assign_legacy_profile(initial_profile)
+    legacy_topics = config.knowledge_base_dir / "topics"
+    profile_topics = config.profile_topics_dir(initial_profile["id"])
+    if legacy_topics.is_dir() and legacy_topics != profile_topics:
+        profile_topics.mkdir(parents=True, exist_ok=True)
+        for child in legacy_topics.iterdir():
+            target = profile_topics / child.name
+            if target.exists():
+                raise RuntimeError(f"迁移旧知识库时目标已存在：{target}")
+            shutil.move(str(child), str(target))
+        legacy_topics.rmdir()
+        db.rebase_artifact_paths(legacy_topics, profile_topics)
     worker = JobWorker(Pipeline(db, config), concurrency=config.job_worker_concurrency)
 
     def prepare_profile(request: KnowledgeProfileRequest) -> dict:
@@ -126,11 +140,24 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
         )
         if len(parts) != len(unique_ids):
             raise HTTPException(status_code=422, detail="包含不属于该视频的分 P")
-        job_id, created = db.create_job_if_absent(request.video_id, unique_ids)
+        profile = (
+            db.get_knowledge_profile(request.profile_id)
+            if request.profile_id
+            else db.active_knowledge_profile()
+        )
+        if not profile:
+            raise HTTPException(status_code=404, detail="知识库 Profile 不存在")
+        job_id, created = db.create_job_if_absent(
+            request.video_id,
+            unique_ids,
+            profile,
+            request.draft_policy,
+            config.llm_model,
+        )
         if not created:
             raise HTTPException(
                 status_code=409,
-                detail="相同视频任务已存在，请在历史任务中查看；失败任务可直接重试",
+                detail="该视频已经应用到这个知识库，请在历史任务中查看；失败任务可直接重试",
             )
         if start_worker:
             worker.enqueue(job_id)
@@ -148,9 +175,20 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
         return job
 
     @app.post("/api/knowledge/regenerate")
-    def regenerate_knowledge_base() -> dict:
+    def regenerate_knowledge_base(profile_id: str | None = None) -> dict:
+        active_profile = db.active_knowledge_profile()
+        if not active_profile:
+            raise HTTPException(status_code=409, detail="当前没有启用的知识库")
+        if profile_id and profile_id != active_profile["id"]:
+            raise HTTPException(
+                status_code=409,
+                detail="当前启用的知识库已变化，请刷新页面后重试",
+            )
+        profile = active_profile
         active_jobs = db.one(
-            "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('queued','running')"
+            """SELECT COUNT(*) AS count FROM jobs
+            WHERE profile_id=? AND status IN ('queued','running')""",
+            (profile["id"],),
         )["count"]
         if active_jobs:
             raise HTTPException(
@@ -159,47 +197,48 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
             )
 
         eligible_parts: list[tuple[str, str]] = []
-        generated_paths: set[Path] = set()
         jobs_to_queue: list[str] = []
-        # Process old jobs first so the rebuilt topics evolve in their original order.
-        for job in sorted(db.list_jobs(), key=lambda item: (item["created_at"], item["id"])):
+        knowledge_updates: list[Path] = []
+        profile_jobs = [
+            job for job in db.list_jobs() if job.get("profile_id") == profile["id"]
+        ]
+        for job in sorted(profile_jobs, key=lambda item: (item["created_at"], item["id"])):
             for part in job["parts"]:
                 paths = worker.pipeline._paths(job, part)
-                if paths["transcript"].is_file() and paths["metadata"].is_file():
+                if paths["document"].is_file():
                     eligible_parts.append((job["id"], part["id"]))
+                    knowledge_updates.append(paths["knowledge_update"])
                     if job["id"] not in jobs_to_queue:
                         jobs_to_queue.append(job["id"])
-                for artifact in part["artifacts"]:
-                    if artifact["kind"] in {"document", "knowledge_update", "index"}:
-                        generated_paths.add(Path(artifact["path"]))
 
         if not eligible_parts:
             raise HTTPException(
                 status_code=409,
-                detail="没有可重新生成的历史任务；至少需要保留完整的转写和元数据",
+                detail="这个知识库没有可重新归档的历史知识稿",
             )
 
-        for path in generated_paths:
-            if within_directory(path, config.source_output_dir) or within_directory(
-                path, config.knowledge_base_dir
-            ):
-                with suppress(OSError):
-                    path.unlink(missing_ok=True)
-        topics_directory = config.knowledge_base_dir / "topics"
+        topics_directory = config.profile_topics_dir(profile["id"])
         shutil.rmtree(topics_directory, ignore_errors=True)
         topics_directory.mkdir(parents=True, exist_ok=True)
+        for update_path in knowledge_updates:
+            update_path.unlink(missing_ok=True)
 
         now = utcnow()
         with db.transaction() as connection:
             connection.execute(
-                "DELETE FROM artifacts WHERE kind IN ('document','topic','knowledge_update','index')"
+                """DELETE FROM artifacts WHERE job_id IN
+                (SELECT id FROM jobs WHERE profile_id=?)
+                AND kind IN ('topic','knowledge_update','index')""",
+                (profile["id"],),
             )
-            connection.execute("DELETE FROM knowledge_topics")
+            connection.execute(
+                "DELETE FROM knowledge_topics WHERE profile_id=?", (profile["id"],)
+            )
             for job_id, part_id in eligible_parts:
                 connection.execute(
                     """UPDATE job_stages SET status='pending',error=NULL,started_at=NULL,
-                    finished_at=NULL,retries=retries+CASE WHEN stage='generate' THEN 1 ELSE 0 END
-                    WHERE job_id=? AND part_id=? AND stage IN ('generate','organize','publish')""",
+                    finished_at=NULL,retries=retries+CASE WHEN stage='organize' THEN 1 ELSE 0 END
+                    WHERE job_id=? AND part_id=? AND stage IN ('organize','publish')""",
                     (job_id, part_id),
                 )
                 connection.execute(
@@ -216,7 +255,8 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
         if start_worker:
             worker.enqueue_serial(jobs_to_queue)
         logger.info(
-            "Knowledge base regeneration queued jobs=%d parts=%d",
+            "Knowledge base regeneration queued profile_id=%s jobs=%d parts=%d",
+            profile["id"],
             len(jobs_to_queue),
             len(eligible_parts),
         )
@@ -386,18 +426,32 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
         except AIServiceError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    def knowledge_file(relative_path: str) -> Path:
+    def resolve_knowledge_profile(profile_id: str | None) -> dict:
+        profile = (
+            db.get_knowledge_profile(profile_id)
+            if profile_id
+            else db.active_knowledge_profile()
+        )
+        if not profile:
+            raise HTTPException(status_code=404, detail="知识库 Profile 不存在")
+        return profile
+
+    def knowledge_file(relative_path: str, profile_id: str | None = None) -> Path:
         if not relative_path or Path(relative_path).is_absolute():
             raise HTTPException(status_code=400, detail="知识库文件路径无效")
-        path = config.knowledge_base_dir / relative_path
-        topics_directory = config.knowledge_base_dir / "topics"
+        profile = resolve_knowledge_profile(profile_id)
+        profile_root = config.profile_knowledge_dir(profile["id"])
+        path = profile_root / relative_path
+        topics_directory = config.profile_topics_dir(profile["id"])
         if not within_directory(path, topics_directory) or not path.is_file():
             raise HTTPException(status_code=404, detail="知识库文件不存在或路径无效")
         return path
 
     @app.get("/api/knowledge/files")
-    def knowledge_files() -> list[dict]:
-        topics_directory = config.knowledge_base_dir / "topics"
+    def knowledge_files(profile_id: str | None = None) -> list[dict]:
+        profile = resolve_knowledge_profile(profile_id)
+        profile_root = config.profile_knowledge_dir(profile["id"])
+        topics_directory = config.profile_topics_dir(profile["id"])
         topics_directory.mkdir(parents=True, exist_ok=True)
 
         def entries(directory: Path) -> list[dict]:
@@ -415,7 +469,7 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
                     continue
                 if child.is_file() and child.suffix.lower() not in {".md", ".markdown"}:
                     continue
-                relative = child.relative_to(config.knowledge_base_dir).as_posix()
+                relative = child.relative_to(profile_root).as_posix()
                 try:
                     stat = child.stat()
                 except OSError:
@@ -439,23 +493,9 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
                 result.append(item)
             return result
 
-        # Remove only genuinely empty legacy task directories. Directories containing any file
-        # remain untouched, even though task artifacts are intentionally hidden from this API.
-        for directory in sorted(
-            (item for item in config.knowledge_base_dir.rglob("*") if item.is_dir()),
-            key=lambda item: len(item.parts),
-            reverse=True,
-        ):
-            if directory == topics_directory or within_directory(directory, topics_directory):
-                continue
-            with suppress(OSError):
-                directory.rmdir()
-
-        profile = db.active_knowledge_profile()
-        name = profile["name"] if profile else "知识库"
         children = entries(topics_directory)
         return [{
-            "name": name,
+            "name": profile["name"],
             "path": "@knowledge-base",
             "type": "directory",
             "size": None,
@@ -467,8 +507,8 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
         }]
 
     @app.get("/api/knowledge/file", response_class=PlainTextResponse)
-    def read_knowledge_file(path: str) -> str:
-        file_path = knowledge_file(path)
+    def read_knowledge_file(path: str, profile_id: str | None = None) -> str:
+        file_path = knowledge_file(path, profile_id)
         if file_path.suffix.lower() not in {".md", ".markdown", ".txt", ".json"}:
             raise HTTPException(status_code=415, detail="该文件类型不支持在线预览")
         if file_path.stat().st_size > 2 * 1024 * 1024:
@@ -479,13 +519,13 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
             raise HTTPException(status_code=415, detail="该文件不是 UTF-8 文本") from exc
 
     @app.get("/api/knowledge/file/download")
-    def download_knowledge_file(path: str) -> FileResponse:
-        file_path = knowledge_file(path)
+    def download_knowledge_file(path: str, profile_id: str | None = None) -> FileResponse:
+        file_path = knowledge_file(path, profile_id)
         return FileResponse(file_path, filename=file_path.name)
 
     @app.get("/api/knowledge/file/pdf")
-    def export_knowledge_pdf(path: str) -> Response:
-        file_path = knowledge_file(path)
+    def export_knowledge_pdf(path: str, profile_id: str | None = None) -> Response:
+        file_path = knowledge_file(path, profile_id)
         if file_path.suffix.lower() not in {".md", ".markdown", ".txt"}:
             raise HTTPException(status_code=415, detail="该文件类型不支持导出 PDF")
         font_path = "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"
@@ -514,8 +554,8 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
         return Response(output.getvalue(), media_type="application/pdf", headers={"Content-Disposition": disposition})
 
     @app.post("/api/knowledge/file/refactor", response_class=PlainTextResponse)
-    def refactor_knowledge_file(path: str) -> str:
-        file_path = knowledge_file(path)
+    def refactor_knowledge_file(path: str, profile_id: str | None = None) -> str:
+        file_path = knowledge_file(path, profile_id)
         if file_path.suffix.lower() not in {".md", ".markdown"}:
             raise HTTPException(status_code=415, detail="只能重构 Markdown 主题")
         try:
@@ -530,7 +570,9 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
 
     @app.post("/api/knowledge/profiles", status_code=201)
     def create_knowledge_profile(request: KnowledgeProfileRequest) -> dict:
-        return db.save_knowledge_profile(prepare_profile(request))
+        profile = db.save_knowledge_profile(prepare_profile(request))
+        config.profile_topics_dir(profile["id"]).mkdir(parents=True, exist_ok=True)
+        return profile
 
     @app.put("/api/knowledge/profiles/{profile_id}")
     def update_knowledge_profile(profile_id: str, request: KnowledgeProfileRequest) -> dict:
@@ -547,10 +589,24 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
 
     @app.delete("/api/knowledge/profiles/{profile_id}", status_code=204)
     def delete_knowledge_profile(profile_id: str) -> None:
-        if not db.get_knowledge_profile(profile_id):
+        profile = db.get_knowledge_profile(profile_id)
+        if not profile:
             raise HTTPException(status_code=404, detail="知识库 Profile 不存在")
+        job_count = db.one(
+            "SELECT COUNT(*) AS count FROM jobs WHERE profile_id=?", (profile_id,)
+        )["count"]
+        topics_directory = config.profile_topics_dir(profile_id)
+        has_topics = topics_directory.is_dir() and any(
+            path.is_file() for path in topics_directory.rglob("*")
+        )
+        if job_count or has_topics:
+            raise HTTPException(
+                status_code=409,
+                detail="这个知识库已有历史任务或知识内容，不能删除",
+            )
         if not db.delete_knowledge_profile(profile_id):
             raise HTTPException(status_code=409, detail="不能删除当前启用或唯一的 Profile")
+        shutil.rmtree(config.profile_knowledge_dir(profile_id), ignore_errors=True)
 
     @app.post("/api/knowledge/topic-suggestion")
     def suggest_knowledge_topic(request: TopicSuggestionRequest) -> dict:

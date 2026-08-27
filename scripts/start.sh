@@ -72,19 +72,7 @@ start_docker() {
   docker info >/dev/null 2>&1 || \
     die "检测到 Docker 命令，但无法连接 Docker 服务；请先启动 Docker"
 
-  local container_id
-  container_id="$({
-    cd "${PROJECT_DIR}"
-    docker compose ps --status running -q bili-knowledge
-  })"
-  if [[ -n "${container_id}" ]]; then
-    echo "拾影成文 Docker 服务已在运行，本次不重复启动。"
-    echo "  Web 页面： http://127.0.0.1:${FRONTEND_PORT}"
-    echo "  查看状态： docker compose ps"
-    exit 0
-  fi
-
-  echo "正在使用 Docker Compose 启动拾影成文……"
+  echo "正在使用 Docker Compose 启动或更新拾影成文……"
   (
     cd "${PROJECT_DIR}"
     docker compose up -d --build

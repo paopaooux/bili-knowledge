@@ -2,7 +2,7 @@ import { Children, isValidElement, memo, useEffect, useMemo, useState } from 're
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api } from './api'
-import type { Artifact, Inspection, Job, KnowledgeFile, KnowledgeProfile, StageName, Status } from './types'
+import type { Artifact, DraftPolicy, Inspection, Job, KnowledgeFile, KnowledgeProfile, StageName, Status } from './types'
 
 const stageLabels: Record<StageName, string> = {
   parse: '解析', acquire: '获取素材', transcribe: '转写', generate: '生成知识稿', organize: '归档知识', publish: '发布',
@@ -105,6 +105,9 @@ export default function App() {
   const [jobs, setJobs] = useState<Job[]>([])
   const [settings, setSettings] = useState<Record<string, string | boolean | null>>({})
   const [profiles, setProfiles] = useState<KnowledgeProfile[]>([])
+  const [jobProfileId, setJobProfileId] = useState('')
+  const [draftPolicy, setDraftPolicy] = useState<DraftPolicy>('reuse')
+  const [knowledgeProfileId, setKnowledgeProfileId] = useState('')
   const [profileDraft, setProfileDraft] = useState<KnowledgeProfile | null>(null)
   const [profileOpen, setProfileOpen] = useState(false)
   const [profileTab, setProfileTab] = useState<'editor' | 'guide'>('editor')
@@ -129,11 +132,23 @@ export default function App() {
   const [expandedHistoryJobId, setExpandedHistoryJobId] = useState<string | null>(null)
 
   const active = useMemo(() => jobs.some(job => ['queued', 'running'].includes(job.status)), [jobs])
+  const activeProfile = useMemo(
+    () => profiles.find(profile => profile.is_active),
+    [profiles],
+  )
+  const activeProfileJobs = useMemo(
+    () => jobs.filter(job => job.profile_id === activeProfile?.id),
+    [activeProfile?.id, jobs],
+  )
+  const activeProfileBusy = useMemo(
+    () => activeProfileJobs.some(job => ['queued', 'running'].includes(job.status)),
+    [activeProfileJobs],
+  )
   const retryableFailedJobs = useMemo(() => jobs.flatMap(job => {
-    if (job.status !== 'failed') return []
+    if (job.profile_id !== activeProfile?.id || job.status !== 'failed') return []
     const target = retryableFailure(job)
     return target ? [{ job, target }] : []
-  }), [jobs])
+  }), [activeProfile?.id, jobs])
   const visibleJobs = useMemo(() => {
     const orderedJobs = [...jobs].sort((left, right) => {
       const runningDifference = Number(right.status === 'running') - Number(left.status === 'running')
@@ -162,6 +177,9 @@ export default function App() {
     const selected = result.find(profile => profile.id === preferredId)
       || result.find(profile => profile.is_active)
       || result[0]
+    setJobProfileId(current => result.some(profile => profile.id === current)
+      ? current
+      : (selected?.id || ''))
     setProfileDraft(selected ? JSON.parse(JSON.stringify(selected)) as KnowledgeProfile : null)
   }
 
@@ -209,10 +227,10 @@ export default function App() {
   }
 
   async function submit() {
-    if (!inspection?.parts[0]) return
+    if (!inspection?.parts[0] || !jobProfileId) return
     setBusy(true); setNotice('')
     try {
-      await api.createJob(inspection.id, [inspection.parts[0].id])
+      await api.createJob(inspection.id, [inspection.parts[0].id], jobProfileId, draftPolicy)
       setInspection(null); setUrl('')
       await refresh()
       setNotice('任务已加入本地队列')
@@ -314,10 +332,12 @@ export default function App() {
   }
 
   async function openKnowledge() {
+    const profileId = profiles.find(profile => profile.is_active)?.id || profiles[0]?.id || ''
+    setKnowledgeProfileId(profileId)
     setKnowledgeOpen(true)
     setKnowledgeLoading(true)
     try {
-      const files = await api.knowledgeFiles()
+      const files = await api.knowledgeFiles(profileId)
       setKnowledgeFiles(files)
       setKnowledgeSelection(null)
       setExpandedPaths(new Set(files.map(item => item.path)))
@@ -328,8 +348,20 @@ export default function App() {
   async function selectKnowledgeFile(entry: KnowledgeFile) {
     setKnowledgeSelection({ entry })
     if (!entry.previewable) return
-    try { setKnowledgeSelection({ entry, content: await api.knowledgeFile(entry.path) }) }
+    try { setKnowledgeSelection({ entry, content: await api.knowledgeFile(entry.path, knowledgeProfileId) }) }
     catch (error) { setNotice(errorText(error)) }
+  }
+
+  async function switchKnowledgeProfile(profileId: string) {
+    setKnowledgeProfileId(profileId)
+    setKnowledgeLoading(true)
+    setKnowledgeSelection(null)
+    try {
+      const files = await api.knowledgeFiles(profileId)
+      setKnowledgeFiles(files)
+      setExpandedPaths(new Set(files.map(item => item.path)))
+    } catch (error) { setNotice(errorText(error)) }
+    finally { setKnowledgeLoading(false) }
   }
 
   function toggleKnowledgeDirectory(path: string) {
@@ -347,10 +379,10 @@ export default function App() {
     setRefactorConfirmOpen(false)
     setRefactoringPath(entry.path)
     try {
-      const content = await api.refactorKnowledgeFile(entry.path)
+      const content = await api.refactorKnowledgeFile(entry.path, knowledgeProfileId)
       setKnowledgeSelection({ entry, content })
       setNotice('已整理合并')
-      const files = await api.knowledgeFiles()
+      const files = await api.knowledgeFiles(knowledgeProfileId)
       setKnowledgeFiles(files)
     } catch (error) { setNotice(errorText(error)) }
     finally { setRefactoringPath(null) }
@@ -396,13 +428,13 @@ export default function App() {
   }
 
   async function regenerateKnowledgeBase() {
-    if (regeneratingKnowledge || active) return
+    if (regeneratingKnowledge || activeProfileBusy || !activeProfile) return
     setRegenerateConfirmOpen(false)
     setRegeneratingKnowledge(true)
     try {
-      const result = await api.regenerateKnowledge()
+      const result = await api.regenerateKnowledge(activeProfile.id)
       await refresh()
-      setNotice(`已清空旧知识并重新排队：${result.queued_jobs} 条任务`)
+      setNotice(`已清空当前知识库的旧归档并重新排队：${result.queued_jobs} 条任务`)
     } catch (error) { setNotice(errorText(error)) }
     finally { setRegeneratingKnowledge(false) }
   }
@@ -451,7 +483,7 @@ export default function App() {
 
   async function deleteProfile() {
     if (!profileDraft?.id || profileDraft.is_active) return
-    if (!window.confirm(`确定删除 Profile「${profileDraft.name}」吗？\n\n只会删除这套整理规则，已经生成的 Markdown 知识内容不会被删除。`)) return
+    if (!window.confirm(`确定删除空知识库「${profileDraft.name}」吗？\n\n已有历史任务或知识内容的知识库不能删除。`)) return
     try {
       await api.deleteProfile(profileDraft.id)
       await loadProfiles()
@@ -526,12 +558,16 @@ export default function App() {
             {inspection.cover_url && <img src={inspection.cover_url} alt="视频封面" referrerPolicy="no-referrer" />}
             <div><span>{inspection.bvid}</span><h3>{inspection.title}</h3><p>{inspection.uploader || '未知 UP 主'} · {duration(inspection.duration)}</p></div>
           </div>
-          <button className="primary submit" disabled={busy || !inspection.parts.length} onClick={() => void submit()}>生成知识文档 →</button>
+          <div className="job-options">
+            <label><small>目标知识库</small><select aria-label="目标知识库" value={jobProfileId} onChange={event => setJobProfileId(event.target.value)}>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select></label>
+            <div><small>知识稿</small><div className="draft-policy" role="group" aria-label="知识稿生成方式"><button className={draftPolicy === 'reuse' ? 'selected' : ''} onClick={() => setDraftPolicy('reuse')}>复用已有</button><button className={draftPolicy === 'regenerate' ? 'selected' : ''} onClick={() => setDraftPolicy('regenerate')}>重新生成</button></div></div>
+          </div>
+          <button className="primary submit" disabled={busy || !inspection.parts.length || !jobProfileId} onClick={() => void submit()}>应用到知识库 →</button>
         </div>}
       </section>}
 
       {page === 'history' && <section className="history-page">
-        <div className="history-heading"><div><small>ALL PROCESSING JOBS</small><h2>历史任务</h2><p>共 {jobs.length} 条解析记录</p></div><div className="history-heading-actions">{retryableFailedJobs.length > 0 && <button className="ghost quick-retry" disabled={retryingFailedJobs} onClick={() => void retryAllFailedJobs()}>{retryingFailedJobs ? '正在批量重试…' : `一键重试失败任务（${retryableFailedJobs.length}）`}</button>}<button className="ghost danger history-regenerate" title={active ? '请等待当前队列处理完成' : '清空旧知识正文和归档主题，并从转写重新生成'} disabled={regeneratingKnowledge || active || !jobs.length} onClick={() => setRegenerateConfirmOpen(true)}>{regeneratingKnowledge ? '正在清空并排队…' : '重新生成知识库'}</button></div></div>
+        <div className="history-heading"><div><small>ALL PROCESSING JOBS</small><h2>历史任务</h2><p>共 {jobs.length} 条解析记录</p></div><div className="history-heading-actions">{retryableFailedJobs.length > 0 && <button className="ghost quick-retry" disabled={retryingFailedJobs} onClick={() => void retryAllFailedJobs()}>{retryingFailedJobs ? '正在批量重试…' : `一键重试当前知识库失败任务（${retryableFailedJobs.length}）`}</button>}<button className="ghost danger history-regenerate" title={activeProfileBusy ? '请等待当前知识库的队列处理完成' : '保留知识稿，重新归档当前启用的知识库'} disabled={regeneratingKnowledge || activeProfileBusy || !activeProfileJobs.length} onClick={() => setRegenerateConfirmOpen(true)}>{regeneratingKnowledge ? '正在清空并排队…' : '重新归档当前知识库'}</button></div></div>
         <div className="history-tools"><label className="history-search"><span aria-hidden="true">⌕</span><input aria-label="搜索历史任务" value={historyQuery} onChange={event => setHistoryQuery(event.target.value)} placeholder="搜索标题或 BV 号"/>{historyQuery && <button aria-label="清空搜索" onClick={() => setHistoryQuery('')}>×</button>}</label><div className="history-status-tabs" role="group" aria-label="筛选任务状态">{([['all', '全部'], ['active', '处理中'], ['completed', '已完成'], ['failed', '失败']] as const).map(([status, label]) => <button key={status} className={historyStatus === status ? 'active' : ''} onClick={() => setHistoryStatus(status)}>{label}</button>)}</div><button className="history-refresh" onClick={() => void refresh()}>↻ 刷新</button></div>
         <div className="history-summary">找到 {visibleJobs.length} 条记录</div>
       </section>}
@@ -542,7 +578,7 @@ export default function App() {
         {visibleJobs.map(job => {
           const historyExpanded = page === 'history' && expandedHistoryJobId === job.id
           return <article className={`job-card ${page === 'history' ? 'history-job' : ''} ${historyExpanded ? 'expanded' : ''}`} key={job.id}>
-          <div className="job-head"><div><span>{job.bvid}</span><h3>{job.video_title}</h3><small>{page === 'history' ? '最后更新：' : ''}{new Date(page === 'history' ? (job.updated_at || job.created_at) : job.created_at).toLocaleString()}</small>{page === 'history' && job.video_url && <a className="history-source-link" href={job.video_url} target="_blank" rel="noreferrer">{job.video_url} ↗</a>}</div>
+          <div className="job-head"><div><span>{job.bvid}{job.profile_name ? ` · ${job.profile_name}` : ''}</span><h3>{job.video_title}</h3><small>{page === 'history' ? '最后更新：' : ''}{new Date(page === 'history' ? (job.updated_at || job.created_at) : job.created_at).toLocaleString()}</small>{page === 'history' && job.video_url && <a className="history-source-link" href={job.video_url} target="_blank" rel="noreferrer">{job.video_url} ↗</a>}</div>
             <div className="job-head-actions"><span className={`status ${job.status}`}>{statusLabels[job.status]}</span>{page === 'history' && <button className="history-toggle" aria-expanded={historyExpanded} onClick={() => setExpandedHistoryJobId(historyExpanded ? null : job.id)}>{historyExpanded ? '收起' : '展开'}</button>}</div></div>
           {(page === 'home' || historyExpanded) && <>{job.error && !jobErrorAlreadyShownByStage(job) && <div className="error-box">{job.error}</div>}
           {job.parts.map(part => <div className="part-progress" key={part.id}>
@@ -589,7 +625,7 @@ export default function App() {
           </div>
           {profileTab === 'guide' ? <article className="profile-guide">
             <div className="guide-hero"><small>PROFILE PLAYBOOK</small><h2>先决定留下什么，再决定放到哪里</h2><p>Profile 不是提示词堆砌，而是你的长期编辑方针。规则越清楚，知识库越稳定。</p><div className="guide-pipeline"><div><b>01</b><strong>视频内容</strong><span>字幕或语音转写</span></div><i>→</i><div><b>02</b><strong>关注范围</strong><span>筛选值得保留的内容</span></div><i>→</i><div><b>03</b><strong>推荐主题</strong><span>选择合适的知识归属</span></div><i>→</i><div><b>04</b><strong>主题知识</strong><span>新建或合并 Markdown</span></div></div></div>
-            <section><span>01</span><div><h3>Profile 是什么？</h3><p>一个 Profile 代表一套知识库编辑策略。它由整理模式、关注范围和推荐主题共同组成，只影响知识筛选与归档，不改变原始转写。</p><div className="guide-callout"><strong>一句话理解</strong><p>关注范围是“编辑方针”，推荐主题是“书架目录”。guided 中它们是优先级，strict 中才是强制过滤和目录限制。</p></div><div className="guide-warning"><strong>当前版本</strong><p>多个 Profile 共用同一个本地 Markdown 知识目录，它们是不同的整理规则，不是相互隔离的物理知识库。切换或删除 Profile 都不会删除已有知识文件。</p></div></div></section>
+            <section><span>01</span><div><h3>Profile 是什么？</h3><p>一个 Profile 代表一套独立知识库及其编辑策略。它由整理模式、关注范围和推荐主题共同组成，不同 Profile 的主题、索引和去重范围彼此隔离。</p><div className="guide-callout"><strong>一句话理解</strong><p>关注范围是“编辑方针”，推荐主题是“书架目录”。guided 中它们是优先级，strict 中才是强制过滤和目录限制。</p></div><div className="guide-warning"><strong>来源复用</strong><p>同一视频的转写和知识稿可以用于多个知识库；每个知识库仍会按自己的 Profile 重新路由和归档。</p></div></div></section>
             <section><span>02</span><div><h3>关注范围和推荐主题有什么区别？</h3><div className="guide-compare"><div><small>关注范围 · SCOPE</small><strong>描述优先关注什么</strong><p>guided 中用于优先归类，不会过滤其他有价值内容；strict 中才作为强制收录范围。</p></div><div><small>推荐主题 · ROUTE</small><strong>决定优先归到哪里</strong><p>每个主题需要名称和边界清楚的描述。主题之间应尽量少重叠。</p></div></div></div></section>
             <section><span>03</span><div><h3>选择整理模式</h3><div className="guide-modes"><div><small>探索期</small><strong>开放 · open</strong><p>几乎不限制领域，系统可自由建立主题。适合还不知道知识库结构时使用。</p></div><div className="recommended"><small>推荐</small><strong>引导 · guided</strong><p>优先使用关注范围和推荐主题；匹配不上时，也会为其他有价值的内容自由建立主题。</p></div><div><small>固定目录</small><strong>严格 · strict</strong><p>只能写入推荐主题；超出范围或无法归类的知识会被忽略。</p></div></div></div></section>
             <section><span>04</span><div><h3>如何写关注范围？</h3><p>建议包含三部分：关注的领域、希望保留的内容特征、明确排除项。不要只写关键词。</p><blockquote>关注两性关系中的认知规律，以及线上聊天、语音聊天和线下约会中的沟通技巧；整理能够体现谈吐、促进相互了解的谈资和可执行建议；同时收录星座基础知识及其作为社交谈资的使用方式。优先保留具体、有适用条件、尊重双方边界的内容；忽略广告、操控性话术、外貌打分和缺乏依据的绝对化结论。</blockquote><p className="guide-caption">好的范围既告诉系统“要什么”，也告诉系统“不要什么”。</p></div></section>
@@ -633,7 +669,7 @@ export default function App() {
 
     {knowledgeOpen && <div className="modal-backdrop" onMouseDown={() => setKnowledgeOpen(false)}>
       <div className="modal knowledge-browser" role="dialog" aria-modal="true" aria-label="知识库目录" onMouseDown={event => event.stopPropagation()}>
-        <header><div><small>KNOWLEDGE BASE</small><h2>{profiles.find(profile => profile.is_active)?.name || '知识库'}</h2><p>仅展示已归档的主题知识</p></div><button aria-label="关闭知识库目录" onClick={() => setKnowledgeOpen(false)}>×</button></header>
+        <header><div><small>KNOWLEDGE BASE</small><h2>{profiles.find(profile => profile.id === knowledgeProfileId)?.name || '知识库'}</h2><p>仅展示已归档的主题知识</p></div><label className="knowledge-profile-select"><small>知识库</small><select aria-label="浏览知识库" value={knowledgeProfileId} onChange={event => void switchKnowledgeProfile(event.target.value)}>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select></label><button aria-label="关闭知识库目录" onClick={() => setKnowledgeOpen(false)}>×</button></header>
         <div className="knowledge-browser-actions">
           <span>知识库名称 → 主题分类 → Markdown</span>
           <div><button className="ghost" onClick={() => void openKnowledge()}>刷新</button></div>
@@ -644,7 +680,7 @@ export default function App() {
           </aside>
           <section className="knowledge-file-preview">
             {!knowledgeSelection ? <div className="browser-placeholder"><b>选择一个文件</b><p>Markdown、JSON 和 TXT 文件可直接预览。</p></div> : <>
-              <div className="knowledge-file-head"><div><strong>{knowledgeSelection.entry.name}</strong><small>{knowledgeSelection.entry.path} · {fileSize(knowledgeSelection.entry.size)}</small></div><div className="knowledge-file-buttons"><button className="ghost" title="合并重复内容并重新组织知识层级" disabled={!knowledgeSelection.entry.name.toLowerCase().endsWith('.md') || refactoringPath !== null} onClick={() => setRefactorConfirmOpen(true)}>{refactoringPath === knowledgeSelection.entry.path ? '整理中…' : '整理合并'}</button>{knowledgeSelection.content && <a className="ghost button-link" href={api.knowledgePdfUrl(knowledgeSelection.entry.path)}>导出 PDF</a>}</div></div>
+              <div className="knowledge-file-head"><div><strong>{knowledgeSelection.entry.name}</strong><small>{knowledgeSelection.entry.path} · {fileSize(knowledgeSelection.entry.size)}</small></div><div className="knowledge-file-buttons"><button className="ghost" title="合并重复内容并重新组织知识层级" disabled={!knowledgeSelection.entry.name.toLowerCase().endsWith('.md') || refactoringPath !== null} onClick={() => setRefactorConfirmOpen(true)}>{refactoringPath === knowledgeSelection.entry.path ? '整理中…' : '整理合并'}</button>{knowledgeSelection.content && <a className="ghost button-link" href={api.knowledgePdfUrl(knowledgeSelection.entry.path, knowledgeProfileId)}>导出 PDF</a>}</div></div>
               {!knowledgeSelection.entry.previewable ? <div className="browser-placeholder"><b>该文件不支持在线预览</b><p>暂不支持导出 PDF。</p></div> : knowledgeSelection.content === undefined ? <div className="browser-placeholder">正在加载内容…</div> : knowledgeSelection.entry.name.toLowerCase().endsWith('.md') || knowledgeSelection.entry.name.toLowerCase().endsWith('.markdown') ? <div className="markdown"><MarkdownView content={knowledgeSelection.content}/></div> : <pre className="plain-preview">{knowledgeSelection.content}</pre>}
             </>}
           </section>
@@ -663,12 +699,12 @@ export default function App() {
     </div>}
 
     {regenerateConfirmOpen && <div className="confirm-backdrop" onMouseDown={() => setRegenerateConfirmOpen(false)}>
-      <div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-label="确认重新生成知识库" onMouseDown={event => event.stopPropagation()}>
+      <div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-label="确认重新归档知识库" onMouseDown={event => event.stopPropagation()}>
         <span className="confirm-icon danger-icon">!</span>
-        <small>REGENERATE KNOWLEDGE BASE</small>
-        <h3>删除并重新生成整个知识库？</h3>
-        <p>现有知识正文和全部归档主题会被永久删除。转写结果会保留，并使用当前知识库设置重新生成正文、重新归档。</p>
-        <div><button className="ghost" onClick={() => setRegenerateConfirmOpen(false)}>取消</button><button className="primary" onClick={() => void regenerateKnowledgeBase()}>确认删除并重新生成</button></div>
+        <small>REORGANIZE KNOWLEDGE BASE</small>
+        <h3>重新归档当前启用的知识库？</h3>
+        <p>当前知识库的归档主题会被清空并重建；转写和知识稿会保留，不会再次调用知识稿模型。</p>
+        <div><button className="ghost" onClick={() => setRegenerateConfirmOpen(false)}>取消</button><button className="primary" onClick={() => void regenerateKnowledgeBase()}>确认重新归档</button></div>
       </div>
     </div>}
 

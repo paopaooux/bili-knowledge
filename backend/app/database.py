@@ -122,6 +122,29 @@ MIGRATIONS = [
     SELECT id,job_id,part_id,kind,path,created_at FROM artifacts_v5;
     DROP TABLE artifacts_v5;
     """,
+    """
+    ALTER TABLE jobs ADD COLUMN profile_id TEXT;
+    ALTER TABLE jobs ADD COLUMN profile_version INTEGER;
+    ALTER TABLE jobs ADD COLUMN profile_snapshot_json TEXT;
+    ALTER TABLE jobs ADD COLUMN draft_policy TEXT NOT NULL DEFAULT 'reuse';
+    ALTER TABLE jobs ADD COLUMN draft_model TEXT;
+    CREATE INDEX IF NOT EXISTS idx_jobs_profile ON jobs(profile_id,created_at);
+
+    ALTER TABLE knowledge_topics RENAME TO knowledge_topics_v6;
+    CREATE TABLE knowledge_topics (
+      profile_id TEXT NOT NULL,
+      path TEXT NOT NULL,
+      source_bvid TEXT,
+      last_action TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(profile_id,path)
+    );
+    INSERT INTO knowledge_topics(profile_id,path,source_bvid,last_action,updated_at)
+    SELECT COALESCE((SELECT id FROM knowledge_profiles WHERE is_active=1 LIMIT 1),''),
+           path,source_bvid,last_action,updated_at
+    FROM knowledge_topics_v6;
+    DROP TABLE knowledge_topics_v6;
+    """,
 ]
 
 
@@ -215,12 +238,37 @@ class Database:
                 saved_parts.append({**part, "id": part_id})
         return {**metadata, "id": video_id, "parts": saved_parts}
 
-    def create_job(self, video_id: str, part_ids: list[str]) -> str:
+    @staticmethod
+    def _profile_snapshot(profile: dict | None) -> tuple[str | None, int | None, str | None]:
+        if not profile:
+            return None, None, None
+        return (
+            profile["id"],
+            int(profile.get("version") or 1),
+            json.dumps(profile, ensure_ascii=False),
+        )
+
+    def create_job(
+        self,
+        video_id: str,
+        part_ids: list[str],
+        profile: dict | None = None,
+        draft_policy: str = "reuse",
+        draft_model: str | None = None,
+    ) -> str:
         job_id, now = str(uuid.uuid4()), utcnow()
+        profile = profile or self.active_knowledge_profile()
+        profile_id, profile_version, profile_snapshot = self._profile_snapshot(profile)
         with self.transaction() as connection:
             connection.execute(
-                "INSERT INTO jobs(id,video_id,status,created_at,updated_at) VALUES (?,?,?,?,?)",
-                (job_id, video_id, "queued", now, now),
+                """INSERT INTO jobs
+                (id,video_id,status,created_at,updated_at,profile_id,profile_version,
+                 profile_snapshot_json,draft_policy,draft_model)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    job_id, video_id, "queued", now, now, profile_id, profile_version,
+                    profile_snapshot, draft_policy, draft_model,
+                ),
             )
             for part_id in part_ids:
                 connection.execute(
@@ -234,9 +282,17 @@ class Database:
                     )
         return job_id
 
-    def create_job_if_absent(self, video_id: str, part_ids: list[str]) -> tuple[str, bool]:
-        """Create a job unless the same BVID and part selection was submitted before."""
+    def create_job_if_absent(
+        self,
+        video_id: str,
+        part_ids: list[str],
+        profile: dict,
+        draft_policy: str = "reuse",
+        draft_model: str | None = None,
+    ) -> tuple[str, bool]:
+        """Create one import per profile, BVID, and part selection."""
         job_id, now = str(uuid.uuid4()), utcnow()
+        profile_id, profile_version, profile_snapshot = self._profile_snapshot(profile)
         with self.transaction() as connection:
             requested = connection.execute(
                 f"""SELECT v.bvid,p.part_index FROM videos v JOIN parts p ON p.video_id=v.id
@@ -248,8 +304,9 @@ class Database:
             if requested:
                 candidates = connection.execute(
                     """SELECT j.id FROM jobs j JOIN videos v ON v.id=j.video_id
-                    WHERE v.bvid=? ORDER BY j.created_at DESC,j.id DESC""",
-                    (requested[0]["bvid"],),
+                    WHERE v.bvid=? AND j.profile_id=?
+                    ORDER BY j.created_at DESC,j.id DESC""",
+                    (requested[0]["bvid"], profile_id),
                 ).fetchall()
                 for candidate in candidates:
                     existing_parts = tuple(
@@ -265,8 +322,14 @@ class Database:
                         return candidate["id"], False
 
             connection.execute(
-                "INSERT INTO jobs(id,video_id,status,created_at,updated_at) VALUES (?,?,?,?,?)",
-                (job_id, video_id, "queued", now, now),
+                """INSERT INTO jobs
+                (id,video_id,status,created_at,updated_at,profile_id,profile_version,
+                 profile_snapshot_json,draft_policy,draft_model)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    job_id, video_id, "queued", now, now, profile_id, profile_version,
+                    profile_snapshot, draft_policy, draft_model,
+                ),
             )
             for part_id in part_ids:
                 connection.execute(
@@ -322,6 +385,7 @@ class Database:
 
     def save_topic_state(
         self,
+        profile_id: str,
         path: str,
         source_bvid: str | None,
         action: str,
@@ -329,14 +393,53 @@ class Database:
     ) -> None:
         self.execute(
             """INSERT INTO knowledge_topics
-            (path,source_bvid,last_action,updated_at)
-            VALUES (?,?,?,?)
-            ON CONFLICT(path) DO UPDATE SET
+            (profile_id,path,source_bvid,last_action,updated_at)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(profile_id,path) DO UPDATE SET
               source_bvid=excluded.source_bvid,
               last_action=excluded.last_action,
               updated_at=excluded.updated_at""",
-            (path, source_bvid, action, updated_at),
+            (profile_id, path, source_bvid, action, updated_at),
         )
+
+    def assign_legacy_profile(self, profile: dict) -> None:
+        """Attach pre-isolation jobs and topic state to the initial knowledge base."""
+        snapshot = json.dumps(profile, ensure_ascii=False)
+        with self.transaction() as connection:
+            connection.execute(
+                """UPDATE jobs SET profile_id=?,profile_version=?,profile_snapshot_json=?
+                WHERE profile_id IS NULL OR profile_id=''""",
+                (profile["id"], profile.get("version", 1), snapshot),
+            )
+            connection.execute(
+                "UPDATE knowledge_topics SET profile_id=? WHERE profile_id=''",
+                (profile["id"],),
+            )
+
+    def rebase_artifact_paths(self, old_root: Path, new_root: Path) -> None:
+        old_prefix = str(old_root)
+        with self.transaction() as connection:
+            rows = connection.execute(
+                "SELECT id,path FROM artifacts WHERE path=? OR path LIKE ?",
+                (old_prefix, old_prefix + "/%"),
+            ).fetchall()
+            for row in rows:
+                suffix = Path(row["path"]).relative_to(old_root)
+                connection.execute(
+                    "UPDATE artifacts SET path=? WHERE id=?",
+                    (str(new_root / suffix), row["id"]),
+                )
+
+    @staticmethod
+    def profile_from_job(job: dict) -> dict | None:
+        raw = job.get("profile_snapshot_json")
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
 
     def _profile_from_row(self, row: dict) -> dict:
         rules = json.loads(row.pop("rules_json") or "{}")
@@ -452,8 +555,10 @@ class Database:
 
     def job_detail(self, job_id: str) -> dict | None:
         job = self.one(
-            """SELECT j.*,v.title AS video_title,v.bvid,v.url AS video_url
-            FROM jobs j JOIN videos v ON v.id=j.video_id WHERE j.id=?""",
+            """SELECT j.*,v.title AS video_title,v.bvid,v.url AS video_url,
+            kp.name AS profile_name
+            FROM jobs j JOIN videos v ON v.id=j.video_id
+            LEFT JOIN knowledge_profiles kp ON kp.id=j.profile_id WHERE j.id=?""",
             (job_id,),
         )
         if not job:
@@ -484,8 +589,10 @@ class Database:
         # called job_detail() for every row (four SQL queries per job), which became noticeably
         # slower as history grew.
         jobs = self.all(
-            """SELECT j.*,v.title AS video_title,v.bvid,v.url AS video_url
+            """SELECT j.*,v.title AS video_title,v.bvid,v.url AS video_url,
+            kp.name AS profile_name
             FROM jobs j JOIN videos v ON v.id=j.video_id
+            LEFT JOIN knowledge_profiles kp ON kp.id=j.profile_id
             ORDER BY j.updated_at DESC,j.created_at DESC,j.id DESC"""
         )
         if not jobs:
@@ -530,8 +637,10 @@ class Database:
         """Return only the fields needed by polling clients such as the Android app."""
         jobs = self.all(
             """SELECT j.id,j.status,j.error,j.created_at,j.updated_at,j.cancel_requested,
-            v.title AS video_title,v.bvid,v.url AS video_url
+            j.profile_id,j.draft_policy,j.draft_model,v.title AS video_title,v.bvid,
+            v.url AS video_url,kp.name AS profile_name
             FROM jobs j JOIN videos v ON v.id=j.video_id
+            LEFT JOIN knowledge_profiles kp ON kp.id=j.profile_id
             ORDER BY j.updated_at DESC,j.created_at DESC,j.id DESC"""
         )
         if not jobs:

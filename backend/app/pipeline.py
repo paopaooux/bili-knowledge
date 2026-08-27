@@ -47,6 +47,13 @@ class Pipeline:
         # Routing and organizing update a shared topic catalog and shared Markdown files.
         # Keep this critical section serial while allowing all earlier stages to overlap.
         self.knowledge_write_lock = threading.Lock()
+        self.source_locks_guard = threading.Lock()
+        self.source_locks: dict[tuple[str, int], threading.Lock] = {}
+
+    def _source_lock(self, job: dict, part: dict) -> threading.Lock:
+        key = (job["bvid"], int(part["part_index"]))
+        with self.source_locks_guard:
+            return self.source_locks.setdefault(key, threading.Lock())
 
     def _cancel_guard(self, job_id: str) -> None:
         job = self.db.one("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,))
@@ -69,7 +76,8 @@ class Pipeline:
             "transcript": part_dir / "transcript.json",
             "metadata": part_dir / "metadata.json",
             "document": part_dir / "document.md",
-            "knowledge_update": part_dir / "knowledge-update.json",
+            "knowledge_update": part_dir
+            / f"knowledge-update-{job.get('profile_id') or 'legacy'}.json",
             "temp": temp,
             "audio": temp / "audio.mp3",
         }
@@ -125,42 +133,52 @@ class Pipeline:
             "organize": lambda: self._organize(job, part, paths),
             "publish": lambda: self._publish(job, part, paths),
         }
-        for stage in STAGES:
-            current = self.db.one(
-                "SELECT status FROM job_stages WHERE job_id=? AND part_id=? AND stage=?",
-                (job["id"], part["id"], stage),
-            )
-            if current and current["status"] in {"completed", "skipped"}:
-                continue
-            self._cancel_guard(job["id"])
-            logger.info(
-                "Stage started job_id=%s part_id=%s stage=%s",
-                job["id"],
-                part["id"],
-                stage,
-            )
-            self.db.set_stage(job["id"], part["id"], stage, "running")
-            try:
-                status = handlers[stage]() or "completed"
-                self.db.set_stage(job["id"], part["id"], stage, status)
+        # Different profiles may import the same source concurrently. Serialize that source so
+        # the second import sees a complete transcript/draft instead of racing shared files.
+        with self._source_lock(job, part):
+            for stage in STAGES:
+                current = self.db.one(
+                    "SELECT status FROM job_stages WHERE job_id=? AND part_id=? AND stage=?",
+                    (job["id"], part["id"], stage),
+                )
+                if current and current["status"] in {"completed", "skipped"}:
+                    continue
+                self._cancel_guard(job["id"])
                 logger.info(
-                    "Stage finished job_id=%s part_id=%s stage=%s status=%s",
+                    "Stage started job_id=%s part_id=%s stage=%s",
                     job["id"],
                     part["id"],
                     stage,
-                    status,
                 )
-            except Exception as exc:
-                self.db.set_stage(job["id"], part["id"], stage, "failed", str(exc))
-                self.db.execute(
-                    "UPDATE job_parts SET status='failed' WHERE job_id=? AND part_id=?",
-                    (job["id"], part["id"]),
-                )
-                raise
+                self.db.set_stage(job["id"], part["id"], stage, "running")
+                try:
+                    status = handlers[stage]() or "completed"
+                    self.db.set_stage(job["id"], part["id"], stage, status)
+                    logger.info(
+                        "Stage finished job_id=%s part_id=%s stage=%s status=%s",
+                        job["id"],
+                        part["id"],
+                        stage,
+                        status,
+                    )
+                except Exception as exc:
+                    self.db.set_stage(job["id"], part["id"], stage, "failed", str(exc))
+                    self.db.execute(
+                        "UPDATE job_parts SET status='failed' WHERE job_id=? AND part_id=?",
+                        (job["id"], part["id"]),
+                    )
+                    raise
 
     def _parse(self, job: dict, part: dict, paths: dict[str, Path]) -> str:
         if not part.get("url"):
             raise RuntimeError("分 P 缺少来源链接，请重新解析")
+        previous_metadata = {}
+        if paths["metadata"].is_file() and paths["document"].is_file():
+            try:
+                value = _json_read(paths["metadata"])
+                previous_metadata = value if isinstance(value, dict) else {}
+            except (OSError, ValueError, TypeError):
+                previous_metadata = {}
         metadata = {
             "title": part["title"],
             "video_title": job["video_title"],
@@ -172,8 +190,8 @@ class Pipeline:
             "duration": part.get("duration"),
             "language": "unknown",
             "subtitle_source": None,
-            "generated_at": None,
-            "model": self.settings.llm_model,
+            "generated_at": previous_metadata.get("generated_at"),
+            "model": previous_metadata.get("model"),
         }
         video = self.db.one(
             "SELECT uploader,published_at FROM videos WHERE id=?", (job["video_id"],)
@@ -465,6 +483,33 @@ class Pipeline:
         segments = _json_read(paths["transcript"])
         if not isinstance(segments, list) or not segments:
             raise RuntimeError("转写为空，无法生成知识稿")
+        metadata = _json_read(paths["metadata"])
+        if (
+            paths["document"].is_file()
+            and job.get("draft_policy") != "regenerate"
+            and metadata.get("model") == self.settings.llm_model
+        ):
+            document = paths["document"].read_text(encoding="utf-8")
+            self.db.save_artifact(job["id"], part["id"], "document", paths["document"])
+            self.db.execute(
+                "UPDATE job_parts SET summary=? WHERE job_id=? AND part_id=?",
+                (document[:500], job["id"], part["id"]),
+            )
+            logger.info(
+                "Knowledge draft reused job_id=%s part_id=%s model=%s path=%s",
+                job["id"],
+                part["id"],
+                self.settings.llm_model,
+                paths["document"],
+            )
+            return "skipped"
+        if paths["document"].is_file() and metadata.get("model") != self.settings.llm_model:
+            logger.info(
+                "Knowledge draft model changed; regenerating job_id=%s old_model=%s new_model=%s",
+                job["id"],
+                metadata.get("model"),
+                self.settings.llm_model,
+            )
         transcript = "\n".join(segment["text"] for segment in segments)
         logger.info(
             "Generating knowledge draft job_id=%s part_id=%s segments=%d transcript_chars=%d",
@@ -474,7 +519,6 @@ class Pipeline:
             len(transcript),
         )
         self._cancel_guard(job["id"])
-        metadata = _json_read(paths["metadata"])
         messages = [
             {
                 "role": "system",
@@ -600,10 +644,17 @@ class Pipeline:
         if not paths["document"].exists():
             raise RuntimeError("知识稿文件不存在，无法归档知识")
         with self.knowledge_write_lock:
+            profile = self.db.profile_from_job(job) or self.db.get_knowledge_profile(
+                job.get("profile_id") or ""
+            )
+            if not profile or not job.get("profile_id"):
+                raise RuntimeError("任务没有绑定有效的知识库 Profile")
+            topics_root = self.settings.profile_topics_dir(job["profile_id"])
             result = organize_document(
                 paths["document"],
                 self.settings,
-                profile=self.db.active_knowledge_profile(),
+                profile=profile,
+                topics_root=topics_root,
             )
             logger.info(
                 "Knowledge organized job_id=%s part_id=%s updates=%d targets=%s",
@@ -618,10 +669,9 @@ class Pipeline:
             )
             for update in result["updates"]:
                 topic_path = Path(update["topic_path"])
-                relative_path = topic_path.relative_to(
-                    self.settings.knowledge_base_dir / "topics"
-                ).as_posix()
+                relative_path = topic_path.relative_to(topics_root).as_posix()
                 self.db.save_topic_state(
+                    job["profile_id"],
                     relative_path,
                     job.get("bvid"),
                     update["plan"]["action"],

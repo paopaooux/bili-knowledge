@@ -46,9 +46,15 @@ export interface Job {
   error?: string
   created_at: string
   updated_at?: string
+  profile_id?: string
+  profile_name?: string
+  draft_policy?: 'reuse' | 'regenerate'
+  draft_model?: string
   parts: JobPart[]
   artifacts: Artifact[]
 }
+
+export type DraftPolicy = 'reuse' | 'regenerate'
 
 export type KnowledgeProfileMode = 'open' | 'guided' | 'strict'
 

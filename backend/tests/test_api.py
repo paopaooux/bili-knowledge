@@ -67,16 +67,17 @@ def test_settings_never_returns_keys(settings):
 
 
 def test_browse_and_preview_knowledge_files_without_exposing_absolute_paths(settings):
-    topic = settings.knowledge_base_dir / "topics" / "学习方法.md"
+    app = create_app(settings, start_worker=False)
+    profile = app.state.db.active_knowledge_profile()
+    topic = settings.profile_topics_dir(profile["id"]) / "学习方法.md"
     topic.parent.mkdir(parents=True)
     topic.write_text("# 学习方法\n\n间隔复习。", encoding="utf-8")
-    (settings.knowledge_base_dir / "audio.mp3").write_bytes(b"audio")
-    empty_job = settings.knowledge_base_dir / "失败任务" / "parts" / "P01"
+    (settings.profile_knowledge_dir(profile["id"]) / "audio.mp3").write_bytes(b"audio")
+    empty_job = settings.profile_topics_dir(profile["id"]) / "空目录"
     empty_job.mkdir(parents=True)
     outside = settings.knowledge_base_dir.parent / "secret.md"
     outside.write_text("secret", encoding="utf-8")
 
-    app = create_app(settings, start_worker=False)
     with TestClient(app) as client:
         response = client.get("/api/knowledge/files")
         preview = client.get("/api/knowledge/file", params={"path": "topics/学习方法.md"})
@@ -91,7 +92,7 @@ def test_browse_and_preview_knowledge_files_without_exposing_absolute_paths(sett
     assert payload[0]["children"][0]["previewable"] is True
     assert "audio.mp3" not in str(payload)
     assert "失败任务" not in str(payload)
-    assert not empty_job.exists()
+    assert empty_job.exists()
     assert preview.text == "# 学习方法\n\n间隔复习。"
     assert hidden_artifact.status_code == 404
     assert traversal.status_code == 404
@@ -216,7 +217,7 @@ def test_completed_job_can_retry_only_organize_and_clears_old_topic_artifacts(se
     assert topic.is_file()
 
 
-def test_regenerate_knowledge_clears_outputs_and_queues_from_generate(settings):
+def test_regenerate_knowledge_keeps_drafts_and_queues_from_organize(settings):
     app = create_app(settings, start_worker=False)
     video = app.state.db.save_inspection(FAKE_INSPECTION)
     part_id = video["parts"][0]["id"]
@@ -234,7 +235,8 @@ def test_regenerate_knowledge_clears_outputs_and_queues_from_generate(settings):
     paths["metadata"].write_text('{"title":"P1","video_title":"API 测试"}', encoding="utf-8")
     paths["document"].write_text("# 旧知识正文", encoding="utf-8")
     paths["knowledge_update"].write_text("{}", encoding="utf-8")
-    topic = settings.knowledge_base_dir / "topics" / "旧主题.md"
+    profile = app.state.db.active_knowledge_profile()
+    topic = settings.profile_topics_dir(profile["id"]) / "旧主题.md"
     topic.parent.mkdir(parents=True)
     topic.write_text("# 旧主题", encoding="utf-8")
     for kind, path in (
@@ -243,16 +245,24 @@ def test_regenerate_knowledge_clears_outputs_and_queues_from_generate(settings):
         ("topic", topic),
     ):
         app.state.db.save_artifact(job_id, part_id, kind, path)
-    app.state.db.save_topic_state("旧主题.md", video["bvid"], "create", "2026-01-01")
+    app.state.db.save_topic_state(
+        profile["id"], "旧主题.md", video["bvid"], "create", "2026-01-01"
+    )
+    other_profile = app.state.db.save_knowledge_profile(
+        {"name": "其他知识库", "mode": "open", "scope": "", "preferred_topics": [], "rules": {}}
+    )
+    other_job_id = app.state.db.create_job(video["id"], [part_id], other_profile)
 
     with TestClient(app) as client:
-        response = client.post("/api/knowledge/regenerate")
+        response = client.post(
+            "/api/knowledge/regenerate", params={"profile_id": profile["id"]}
+        )
 
     assert response.status_code == 200
     assert response.json() == {"queued_jobs": 1, "queued_parts": 1}
     assert paths["transcript"].is_file()
     assert paths["metadata"].is_file()
-    assert not paths["document"].exists()
+    assert paths["document"].exists()
     assert not paths["knowledge_update"].exists()
     assert not topic.exists()
     assert app.state.db.all("SELECT * FROM knowledge_topics") == []
@@ -261,11 +271,69 @@ def test_regenerate_knowledge_clears_outputs_and_queues_from_generate(settings):
     stages = {stage["stage"]: stage["status"] for stage in detail["parts"][0]["stages"]}
     assert stages == {
         "parse": "completed", "acquire": "completed", "transcribe": "completed",
-        "generate": "pending", "organize": "pending", "publish": "pending",
+        "generate": "completed", "organize": "pending", "publish": "pending",
     }
     assert {artifact["kind"] for artifact in detail["parts"][0]["artifacts"]} == {
-        "transcript", "metadata"
+        "transcript", "metadata", "document"
     }
+    assert app.state.db.job_detail(other_job_id)["status"] == "queued"
+
+
+def test_regenerate_rejects_stale_profile_selection(settings):
+    app = create_app(settings, start_worker=False)
+    inactive = app.state.db.save_knowledge_profile(
+        {"name": "非当前知识库", "mode": "open", "scope": "", "preferred_topics": [], "rules": {}}
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/knowledge/regenerate", params={"profile_id": inactive["id"]}
+        )
+
+    assert response.status_code == 409
+    assert "当前启用的知识库已变化" in response.json()["detail"]
+
+
+def test_knowledge_files_are_isolated_by_profile(settings):
+    app = create_app(settings, start_worker=False)
+    first = app.state.db.active_knowledge_profile()
+    second = app.state.db.save_knowledge_profile(
+        {"name": "第二知识库", "mode": "open", "scope": "", "preferred_topics": [], "rules": {}}
+    )
+    first_topic = settings.profile_topics_dir(first["id"]) / "共同主题.md"
+    second_topic = settings.profile_topics_dir(second["id"]) / "共同主题.md"
+    first_topic.parent.mkdir(parents=True)
+    second_topic.parent.mkdir(parents=True)
+    first_topic.write_text("# 第一知识库", encoding="utf-8")
+    second_topic.write_text("# 第二知识库", encoding="utf-8")
+
+    with TestClient(app) as client:
+        first_result = client.get(
+            "/api/knowledge/file",
+            params={"profile_id": first["id"], "path": "topics/共同主题.md"},
+        )
+        second_result = client.get(
+            "/api/knowledge/file",
+            params={"profile_id": second["id"], "path": "topics/共同主题.md"},
+        )
+
+    assert first_result.text == "# 第一知识库"
+    assert second_result.text == "# 第二知识库"
+
+
+def test_delete_profile_rejects_existing_jobs(settings):
+    app = create_app(settings, start_worker=False)
+    profile = app.state.db.save_knowledge_profile(
+        {"name": "有任务的库", "mode": "open", "scope": "", "preferred_topics": [], "rules": {}}
+    )
+    video = app.state.db.save_inspection(FAKE_INSPECTION)
+    app.state.db.create_job(video["id"], [video["parts"][0]["id"]], profile)
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/knowledge/profiles/{profile['id']}")
+
+    assert response.status_code == 409
+    assert "已有历史任务或知识内容" in response.json()["detail"]
 
 
 def test_regenerate_knowledge_rejects_while_queue_is_active(settings):
@@ -327,7 +395,7 @@ def test_create_job_deduplicates_same_bvid_and_part_across_inspections(settings)
 
     assert created.status_code == 201
     assert duplicate.status_code == 409
-    assert "相同视频任务已存在" in duplicate.json()["detail"]
+    assert "已经应用到这个知识库" in duplicate.json()["detail"]
     assert app.state.db.one("SELECT COUNT(*) AS count FROM jobs")["count"] == 1
 
 

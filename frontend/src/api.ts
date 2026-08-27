@@ -1,4 +1,4 @@
-import type { Inspection, Job, KnowledgeFile, KnowledgeProfile, StageName, TopicSuggestion } from './types'
+import type { DraftPolicy, Inspection, Job, KnowledgeFile, KnowledgeProfile, StageName, TopicSuggestion } from './types'
 
 export interface TranscriptSegment {
   start: number
@@ -26,8 +26,8 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<{ ok: boolean; worker: 'running' | 'stopped' }>('/api/health'),
   inspect: (url: string) => request<Inspection>('/api/videos/inspect', { method: 'POST', body: JSON.stringify({ url }) }),
-  createJob: (videoId: string, partIds: string[]) => request<Job>('/api/jobs', {
-    method: 'POST', body: JSON.stringify({ video_id: videoId, part_ids: partIds }),
+  createJob: (videoId: string, partIds: string[], profileId: string, draftPolicy: DraftPolicy) => request<Job>('/api/jobs', {
+    method: 'POST', body: JSON.stringify({ video_id: videoId, part_ids: partIds, profile_id: profileId, draft_policy: draftPolicy }),
   }),
   jobs: () => request<Job[]>('/api/jobs'),
   retry: (jobId: string, partId: string, stage: StageName) => request<Job>(`/api/jobs/${jobId}/retry`, {
@@ -41,11 +41,11 @@ export const api = {
   test: (service: 'stt' | 'llm') => request<{ message: string }>('/api/settings/test', {
     method: 'POST', body: JSON.stringify({ service }),
   }),
-  knowledgeFiles: () => request<KnowledgeFile[]>('/api/knowledge/files'),
-  regenerateKnowledge: () => request<{ queued_jobs: number; queued_parts: number }>('/api/knowledge/regenerate', { method: 'POST' }),
-  knowledgeFile: (path: string) => request<string>(`/api/knowledge/file?path=${encodeURIComponent(path)}`),
-  knowledgePdfUrl: (path: string) => `/api/knowledge/file/pdf?path=${encodeURIComponent(path)}`,
-  refactorKnowledgeFile: (path: string) => request<string>(`/api/knowledge/file/refactor?path=${encodeURIComponent(path)}`, { method: 'POST' }),
+  knowledgeFiles: (profileId?: string) => request<KnowledgeFile[]>(`/api/knowledge/files${profileId ? `?profile_id=${encodeURIComponent(profileId)}` : ''}`),
+  regenerateKnowledge: (profileId: string) => request<{ queued_jobs: number; queued_parts: number }>(`/api/knowledge/regenerate?profile_id=${encodeURIComponent(profileId)}`, { method: 'POST' }),
+  knowledgeFile: (path: string, profileId?: string) => request<string>(`/api/knowledge/file?path=${encodeURIComponent(path)}${profileId ? `&profile_id=${encodeURIComponent(profileId)}` : ''}`),
+  knowledgePdfUrl: (path: string, profileId?: string) => `/api/knowledge/file/pdf?path=${encodeURIComponent(path)}${profileId ? `&profile_id=${encodeURIComponent(profileId)}` : ''}`,
+  refactorKnowledgeFile: (path: string, profileId?: string) => request<string>(`/api/knowledge/file/refactor?path=${encodeURIComponent(path)}${profileId ? `&profile_id=${encodeURIComponent(profileId)}` : ''}`, { method: 'POST' }),
   profiles: () => request<KnowledgeProfile[]>('/api/knowledge/profiles'),
   createProfile: (profile: KnowledgeProfile) => request<KnowledgeProfile>('/api/knowledge/profiles', {
     method: 'POST', body: JSON.stringify(profile),

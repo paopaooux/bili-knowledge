@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
 import subprocess
+import tempfile
 import time
 import uuid
 from contextlib import suppress
@@ -193,6 +195,8 @@ def transcribe_audio(path: Path, settings: Settings) -> dict:
     if settings.stt_provider == "dashscope_realtime":
         return _transcribe_dashscope_realtime(path, settings)
     if settings.stt_provider == "dashscope_flash":
+        if settings.stt_model == "qwen-audio-3.0-asr-flash":
+            return _transcribe_qwen_audio_3(path, settings)
         return _transcribe_dashscope_flash(path, settings)
     if settings.stt_provider == "dashscope_filetrans":
         return _transcribe_dashscope_filetrans(path, settings)
@@ -246,6 +250,64 @@ def _transcribe_dashscope_flash(path: Path, settings: Settings) -> dict:
     if not text:
         raise AIServiceError(f"千问 {settings.stt_model} 未返回有效文本")
     return {"text": text, "segments": [], "language": "unknown"}
+
+
+def _transcribe_qwen_audio_3(path: Path, settings: Settings) -> dict:
+    """Call qwen-audio-3.0-asr-flash using its native HTTP input_audio schema."""
+    _headers(settings.stt_api_key)
+    fd, wav_name = tempfile.mkstemp(prefix="qwen-asr-", suffix=".wav")
+    os.close(fd)
+    wav_path = Path(wav_name)
+    try:
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
+            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav_path),
+        ]
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+        except FileNotFoundError as exc:
+            raise AIServiceError("未找到 ffmpeg，无法转换 qwen-audio-3.0-asr-flash 音频") from exc
+        except subprocess.CalledProcessError as exc:
+            raise AIServiceError(f"转换 qwen-audio-3.0-asr-flash 音频失败：{exc.stderr[-500:]}") from exc
+
+        encoded = base64.b64encode(wav_path.read_bytes()).decode("ascii")
+        url = settings.stt_base_url.rstrip("/") + "/services/aigc/multimodal-generation/generation"
+        payload = {
+            "model": settings.stt_model,
+            "input": {
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_audio",
+                        "input_audio": {"data": f"data:audio/wav;base64,{encoded}"},
+                    }],
+                }],
+            },
+            "parameters": {"format": "wav", "sample_rate": "16000"},
+        }
+        headers = {**_headers(settings.stt_api_key), "Content-Type": "application/json", "X-DashScope-SSE": "disable"}
+        try:
+            with httpx.Client(timeout=settings.request_timeout_seconds) as client:
+                response = client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                result = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise AIServiceError(f"千问 {settings.stt_model} 转写失败：{exc}") from exc
+
+        output = result.get("output") or {}
+        choices = output.get("choices") or []
+        message = choices[0].get("message") if choices else {}
+        content = message.get("content") if isinstance(message, dict) else []
+        if isinstance(content, str):
+            text = content.strip()
+        else:
+            text = "".join(str(item.get("text", "")) for item in (content or []) if isinstance(item, dict)).strip()
+        if not text:
+            error = result.get("message") or result.get("code") or "未返回有效文本"
+            raise AIServiceError(f"千问 {settings.stt_model} 转写失败：{error}")
+        return {"text": text, "segments": [], "language": "unknown"}
+    finally:
+        wav_path.unlink(missing_ok=True)
 
 
 def _oss_bucket(settings: Settings) -> oss2.Bucket:

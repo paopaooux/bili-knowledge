@@ -102,6 +102,63 @@ def test_generate_retries_once_when_draft_is_not_json(monkeypatch, settings):
     assert rendered.startswith("# 重试主题\n")
 
 
+@pytest.mark.parametrize(
+    ("draft_policy", "stored_model", "expected_status", "expected_calls"),
+    [
+        ("reuse", "test-llm-model", "skipped", 0),
+        ("reuse", "old-llm-model", "completed", 1),
+        ("regenerate", "test-llm-model", "completed", 1),
+    ],
+)
+def test_generate_respects_reuse_policy_and_model(
+    monkeypatch, settings, draft_policy, stored_model, expected_status, expected_calls
+):
+    db = Database(settings.database_path)
+    db.migrate()
+    profile = db.seed_knowledge_profile(
+        {"name": "测试库", "mode": "open", "scope": "", "preferred_topics": [], "rules": {}}
+    )
+    video = db.save_inspection(
+        {
+            "bvid": "BV1DraftReuse",
+            "url": "https://example.test/video",
+            "title": "知识稿复用测试",
+            "parts": [{"index": 1, "title": "正片", "url": "https://example.test/video", "subtitles": []}],
+        }
+    )
+    job_id = db.create_job(
+        video["id"], [video["parts"][0]["id"]], profile, draft_policy, settings.llm_model
+    )
+    job = db.job_detail(job_id)
+    pipeline = Pipeline(db, settings)
+    part = job["parts"][0]
+    paths = pipeline._paths(job, part)
+    paths["part"].mkdir(parents=True)
+    paths["transcript"].write_text(
+        json.dumps([{"start": 0, "end": 1, "text": "用于生成的转写", "source": "subtitle"}]),
+        encoding="utf-8",
+    )
+    paths["metadata"].write_text(
+        json.dumps({"title": "正片", "video_title": "知识稿复用测试", "model": stored_model}),
+        encoding="utf-8",
+    )
+    paths["document"].write_text("# 已有知识稿\n\n已有正文。\n", encoding="utf-8")
+    calls = []
+
+    def fake_chat(*args, **kwargs):
+        calls.append(args)
+        return json.dumps({"title": "重新生成的主题", "body": "## 新正文\n\n模型重新生成。"}, ensure_ascii=False)
+
+    monkeypatch.setattr("app.pipeline.chat", fake_chat)
+
+    status = pipeline._generate(job, part, paths)
+
+    assert status == expected_status
+    assert len(calls) == expected_calls
+    content = paths["document"].read_text(encoding="utf-8")
+    assert (content.startswith("# 已有知识稿") if expected_calls == 0 else content.startswith("# 重新生成的主题"))
+
+
 def test_dashscope_flash_audio_chunks_overlap_below_five_minutes(monkeypatch, settings, tmp_path):
     settings.stt_provider = "dashscope_flash"
     settings.audio_chunk_seconds = 900
@@ -138,6 +195,9 @@ def test_transcript_overlap_only_removes_exact_repeated_boundary():
 def test_offline_subtitle_pipeline_publishes_documents(monkeypatch, settings):
     db = Database(settings.database_path)
     db.migrate()
+    profile = db.seed_knowledge_profile(
+        {"name": "测试库", "mode": "open", "scope": "", "preferred_topics": [], "rules": {}}
+    )
     video = db.save_inspection(
         {
             "bvid": "BV1AbCdEfGhJ",
@@ -154,7 +214,7 @@ def test_offline_subtitle_pipeline_publishes_documents(monkeypatch, settings):
             ],
         }
     )
-    job_id = db.create_job(video["id"], [video["parts"][0]["id"]])
+    job_id = db.create_job(video["id"], [video["parts"][0]["id"]], profile)
     job = db.job_detail(job_id)
     pipeline = Pipeline(db, settings)
     paths = pipeline._paths(job, job["parts"][0])
@@ -226,6 +286,9 @@ def test_existing_job_keeps_using_legacy_artifacts_after_storage_split(settings)
 def test_organize_persists_every_topic_artifact(monkeypatch, settings):
     db = Database(settings.database_path)
     db.migrate()
+    profile = db.seed_knowledge_profile(
+        {"name": "测试库", "mode": "open", "scope": "", "preferred_topics": [], "rules": {}}
+    )
     video = db.save_inspection(
         {
             "bvid": "BV1MultiTopic",
@@ -237,15 +300,15 @@ def test_organize_persists_every_topic_artifact(monkeypatch, settings):
         }
     )
     part_id = video["parts"][0]["id"]
-    job_id = db.create_job(video["id"], [part_id])
+    job_id = db.create_job(video["id"], [part_id], profile)
     job = db.job_detail(job_id)
     part = job["parts"][0]
     pipeline = Pipeline(db, settings)
     paths = pipeline._paths(job, part)
     paths["document"].parent.mkdir(parents=True, exist_ok=True)
     paths["document"].write_text("# 综合知识\n", encoding="utf-8")
-    first = settings.knowledge_base_dir / "topics/个人成长/时间管理.md"
-    second = settings.knowledge_base_dir / "topics/健康生活/运动习惯.md"
+    first = settings.profile_topics_dir(profile["id"]) / "个人成长/时间管理.md"
+    second = settings.profile_topics_dir(profile["id"]) / "健康生活/运动习惯.md"
     for path in (first, second):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"# {path.stem}\n", encoding="utf-8")
@@ -276,6 +339,44 @@ def test_organize_persists_every_topic_artifact(monkeypatch, settings):
         (job_id, part_id),
     )
     assert [item["path"] for item in artifacts] == sorted([str(first), str(second)])
+
+
+def test_organize_uses_profile_snapshot_from_job(monkeypatch, settings):
+    db = Database(settings.database_path)
+    db.migrate()
+    profile = db.seed_knowledge_profile(
+        {"name": "提交时名称", "mode": "open", "scope": "原始范围", "preferred_topics": [], "rules": {}}
+    )
+    video = db.save_inspection(
+        {
+            "bvid": "BV1Snapshot",
+            "url": "https://example.test/video",
+            "title": "快照测试",
+            "parts": [{"index": 1, "title": "正片", "url": "https://example.test/video", "subtitles": []}],
+        }
+    )
+    job_id = db.create_job(video["id"], [video["parts"][0]["id"]], profile)
+    db.save_knowledge_profile(
+        {**profile, "name": "修改后名称", "scope": "修改后范围"}, profile["id"]
+    )
+    job = db.job_detail(job_id)
+    part = job["parts"][0]
+    pipeline = Pipeline(db, settings)
+    paths = pipeline._paths(job, part)
+    paths["part"].mkdir(parents=True)
+    paths["document"].write_text("# 快照知识\n", encoding="utf-8")
+    captured = {}
+
+    def fake_organize(*args, **kwargs):
+        captured.update(kwargs["profile"])
+        return {"routes": [], "plans": [], "updates": []}
+
+    monkeypatch.setattr("app.pipeline.organize_document", fake_organize)
+
+    pipeline._organize(job, part, paths)
+
+    assert captured["name"] == "提交时名称"
+    assert captured["scope"] == "原始范围"
 
 
 def test_job_worker_runs_up_to_configured_jobs_concurrently():
@@ -337,6 +438,9 @@ def test_job_worker_serial_batch_preserves_order():
 def test_organize_stage_is_serialized(monkeypatch, settings, tmp_path):
     db = Database(settings.database_path)
     db.migrate()
+    profile = db.seed_knowledge_profile(
+        {"name": "测试库", "mode": "open", "scope": "", "preferred_topics": [], "rules": {}}
+    )
     pipeline = Pipeline(db, settings)
     first_entered = threading.Event()
     release_first = threading.Event()
@@ -361,7 +465,12 @@ def test_organize_stage_is_serialized(monkeypatch, settings, tmp_path):
         document.parent.mkdir()
         document.write_text("# knowledge", encoding="utf-8")
         pipeline._organize(
-            {"id": name, "bvid": name},
+            {
+                "id": name,
+                "bvid": name,
+                "profile_id": profile["id"],
+                "profile_snapshot_json": json.dumps(profile, ensure_ascii=False),
+            },
             {"id": name},
             {"document": document, "knowledge_update": document.parent / "update.json"},
         )

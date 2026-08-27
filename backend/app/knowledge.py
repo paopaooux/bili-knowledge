@@ -314,6 +314,48 @@ def _candidate_documents(topics_root: Path, paths: list[str]) -> tuple[list[dict
     return documents, hashes
 
 
+def _deduplicate_batch_knowledge(raw: dict) -> dict:
+    """Keep an exact knowledge point in only its first planned topic update."""
+    updates = raw.get("updates")
+    if not isinstance(updates, list):
+        return raw
+    seen: set[str] = set()
+    normalized = []
+    for item in updates:
+        if not isinstance(item, dict):
+            normalized.append(item)
+            continue
+        sections = item.get("sections")
+        knowledge = sections.get("knowledge") if isinstance(sections, dict) else None
+        if not isinstance(knowledge, list):
+            normalized.append(item)
+            continue
+        unique = []
+        removed = 0
+        for point in knowledge:
+            compact = "".join(str(point).split()).casefold()
+            if compact and compact in seen:
+                removed += 1
+                continue
+            if compact:
+                seen.add(compact)
+            unique.append(point)
+        if removed:
+            logger.warning(
+                "Knowledge plan removed duplicate points target=%s removed=%d",
+                item.get("target_path"),
+                removed,
+            )
+        if knowledge and not unique:
+            logger.warning(
+                "Knowledge plan skipped duplicate-only update target=%s",
+                item.get("target_path"),
+            )
+            continue
+        normalized.append({**item, "sections": {**sections, "knowledge": unique}})
+    return {**raw, "updates": normalized}
+
+
 def _plan(
     source: str,
     routes: list[dict],
@@ -370,6 +412,7 @@ def _plan(
                 item = {**item, "action": "merge"}
             normalized_updates.append(item)
         raw = {**raw, "updates": normalized_updates}
+    raw = _deduplicate_batch_knowledge(raw)
     try:
         plans = validate_update_batch(raw, existing_paths)
     except ValueError as exc:
@@ -574,9 +617,10 @@ def organize_document(
     settings: Settings,
     *,
     profile: dict | None = None,
+    topics_root: Path | None = None,
     chat_func: ChatFunction = chat,
 ) -> dict:
-    topics_root = settings.knowledge_base_dir / "topics"
+    topics_root = topics_root or settings.knowledge_base_dir / "topics"
     catalog_path = topics_root / "index.json"
     topics_root.mkdir(parents=True, exist_ok=True)
     source = _source_note(document)

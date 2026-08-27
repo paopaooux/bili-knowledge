@@ -8,6 +8,7 @@ import pytest
 from app.ai import AIServiceError
 from app.knowledge import (
     KnowledgeOrganizerError,
+    _deduplicate_batch_knowledge,
     organize_document,
     refactor_topic_document,
     validate_update_batch,
@@ -34,6 +35,26 @@ def test_batch_accepts_more_than_fifteen_topics():
     plans = [_topic_plan(index) for index in range(20)]
 
     assert len(validate_update_batch({"updates": plans}, set())) == 20
+
+
+def test_duplicate_knowledge_points_are_kept_in_only_the_first_topic():
+    first = _topic_plan(1)
+    second = _topic_plan(2)
+    third = _topic_plan(3)
+    duplicate = "相同知识点。"
+    first["sections"]["knowledge"] = [duplicate, "第一个主题独有。"]
+    second["sections"]["knowledge"] = [duplicate, "第二个主题独有。"]
+    third["sections"]["knowledge"] = [duplicate]
+
+    result = _deduplicate_batch_knowledge({"updates": [first, second, third]})
+
+    assert len(result["updates"]) == 2
+    assert result["updates"][0]["sections"]["knowledge"] == [
+        duplicate,
+        "第一个主题独有。",
+    ]
+    assert result["updates"][1]["sections"]["knowledge"] == ["第二个主题独有。"]
+    assert len(validate_update_batch(result, set())) == 2
 
 
 def _document(path: Path, title: str = "高效学习视频") -> Path:

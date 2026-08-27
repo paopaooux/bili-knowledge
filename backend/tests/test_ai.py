@@ -405,6 +405,44 @@ def test_qwen_flash_adapter_uses_local_file(monkeypatch, tmp_path: Path):
     assert captured["asr_options"] == {"enable_lid": True, "enable_itn": False}
 
 
+def test_qwen_audio_3_uses_native_input_audio_request(monkeypatch, tmp_path: Path):
+    audio_path = tmp_path / "chunk.mp3"
+    audio_path.write_bytes(b"input")
+    requests = []
+
+    def fake_run(command, **kwargs):
+        Path(command[-1]).write_bytes(b"wav data")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"output": {"choices": [{"message": {"content": "原生接口转写"}}]}},
+        )
+
+    class FakeClient(httpx.Client):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(ai.subprocess, "run", fake_run)
+    monkeypatch.setattr(ai.httpx, "Client", FakeClient)
+    settings = Settings(
+        stt_provider="dashscope_flash",
+        stt_base_url="https://dashscope.aliyuncs.com/api/v1",
+        stt_model="qwen-audio-3.0-asr-flash",
+        stt_api_key="test-key",
+    )
+
+    result = ai.transcribe_audio(audio_path, settings)
+
+    assert result["text"] == "原生接口转写"
+    payload = requests[0].read().decode()
+    assert "/services/aigc/multimodal-generation/generation" in str(requests[0].url)
+    assert '"type":"input_audio"' in payload
+    assert '"format":"wav"' in payload
+    assert '"sample_rate":"16000"' in payload
+
+
 def test_qwen_omni_transcription_uses_instruction_without_asr_options(monkeypatch, tmp_path: Path):
     audio_path = tmp_path / "chunk.mp3"
     audio_path.write_bytes(b"input")

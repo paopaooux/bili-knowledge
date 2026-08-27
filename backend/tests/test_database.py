@@ -93,7 +93,7 @@ def test_migration_is_idempotent(settings):
     db = Database(settings.database_path)
     db.migrate()
     db.migrate()
-    assert db.one("SELECT COUNT(*) AS count FROM schema_migrations")["count"] == 6
+    assert db.one("SELECT COUNT(*) AS count FROM schema_migrations")["count"] == 7
 
 
 def test_part_can_persist_multiple_topic_artifacts(settings):
@@ -119,13 +119,48 @@ def test_part_can_persist_multiple_topic_artifacts(settings):
 def test_topic_state_keeps_only_latest_update(settings):
     db = Database(settings.database_path)
     db.migrate()
-    db.save_topic_state("个人成长/学习方法.md", "BV1", "create", "2026-01-01T00:00:00+00:00")
-    db.save_topic_state("个人成长/学习方法.md", "BV2", "merge", "2026-01-02T00:00:00+00:00")
+    profile = db.seed_knowledge_profile(
+        {
+            "name": "测试库",
+            "mode": "open",
+            "scope": "",
+            "preferred_topics": [],
+            "rules": {"ignore_out_of_scope": False, "merge_similar": True},
+        }
+    )
+    db.save_topic_state(
+        profile["id"], "个人成长/学习方法.md", "BV1", "create", "2026-01-01T00:00:00+00:00"
+    )
+    db.save_topic_state(
+        profile["id"], "个人成长/学习方法.md", "BV2", "merge", "2026-01-02T00:00:00+00:00"
+    )
 
     rows = db.all("SELECT * FROM knowledge_topics")
     assert len(rows) == 1
     assert rows[0]["source_bvid"] == "BV2"
     assert rows[0]["last_action"] == "merge"
+
+
+def test_same_source_is_deduplicated_per_profile(settings):
+    db = Database(settings.database_path)
+    db.migrate()
+    first = db.seed_knowledge_profile(
+        {"name": "A", "mode": "open", "scope": "", "preferred_topics": [], "rules": {}}
+    )
+    second = db.save_knowledge_profile(
+        {"name": "B", "mode": "open", "scope": "", "preferred_topics": [], "rules": {}}
+    )
+    video = db.save_inspection(inspection())
+    part_ids = [video["parts"][0]["id"]]
+
+    _, first_created = db.create_job_if_absent(video["id"], part_ids, first)
+    duplicate_id, duplicate_created = db.create_job_if_absent(video["id"], part_ids, first)
+    second_id, second_created = db.create_job_if_absent(video["id"], part_ids, second)
+
+    assert first_created is True
+    assert duplicate_created is False
+    assert second_created is True
+    assert duplicate_id != second_id
 
 
 def test_profiles_persist_topics_and_active_selection(settings):

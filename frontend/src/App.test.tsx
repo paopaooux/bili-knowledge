@@ -16,12 +16,12 @@ vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
   }))
   if (url.endsWith('/api/health')) return new Response(JSON.stringify({ ok: true, worker: 'running' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
   if (url.includes('/api/knowledge/file/refactor?path=')) return new Response('# 学习方法\n\n- 有效复习需要调整间隔\n  - 根据遗忘程度逐渐拉长间隔\n\n## 我的笔记\n\n<!-- 保留 -->')
-  if (url.endsWith('/api/knowledge/files')) return new Response(JSON.stringify([{
+  if (url.includes('/api/knowledge/files?profile_id=')) return new Response(JSON.stringify([{
     name: '个人成长与学习', path: '@knowledge-base', type: 'directory', size: null, modified_at: '2026-01-01', previewable: false,
     children: [{ name: '学习方法.md', path: 'topics/学习方法.md', type: 'file', size: 32, modified_at: '2026-01-01', previewable: true }],
   }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
   if (url.includes('/api/knowledge/file?path=')) return new Response('# 学习方法\n\n- 间隔复习。\n  - 条件：已经理解材料。\n  - 步骤：逐渐拉长间隔。')
-  if (url.endsWith('/api/knowledge/regenerate')) return new Response(JSON.stringify({ queued_jobs: 1, queued_parts: 1 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  if (url.includes('/api/knowledge/regenerate?profile_id=')) return new Response(JSON.stringify({ queued_jobs: 1, queued_parts: 1 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
   const payload = url.endsWith('/api/jobs') ? jobsPayload : url.endsWith('/api/knowledge/profiles') ? [{
     id: 'profile-1', name: '个人成长与学习', mode: 'guided', scope: '学习与成长知识',
     preferred_topics: [{ name: '学习方法', path: '个人成长/学习方法.md', description: '学习方法' }],
@@ -101,7 +101,7 @@ test('browses the knowledge directory and previews markdown in the page', async 
   fireEvent.click(summary)
   expect(screen.getByText('条件：已经理解材料。')).toBeInTheDocument()
   expect(screen.getByRole('link', { name: '导出 PDF' })).toHaveAttribute(
-    'href', '/api/knowledge/file/pdf?path=topics%2F%E5%AD%A6%E4%B9%A0%E6%96%B9%E6%B3%95.md',
+    'href', '/api/knowledge/file/pdf?path=topics%2F%E5%AD%A6%E4%B9%A0%E6%96%B9%E6%B3%95.md&profile_id=profile-1',
   )
 })
 
@@ -124,7 +124,7 @@ test('refactors the selected topic into a semantic hierarchy', async () => {
 
   expect(await screen.findByText('有效复习需要调整间隔')).toBeInTheDocument()
   expect(fetch).toHaveBeenCalledWith(
-    '/api/knowledge/file/refactor?path=topics%2F%E5%AD%A6%E4%B9%A0%E6%96%B9%E6%B3%95.md',
+    '/api/knowledge/file/refactor?path=topics%2F%E5%AD%A6%E4%B9%A0%E6%96%B9%E6%B3%95.md&profile_id=profile-1',
     expect.objectContaining({ method: 'POST' }),
   )
 })
@@ -150,23 +150,33 @@ test('retries only the organize stage from a completed job', async () => {
 
 test('shows a stage failure only once when the job has the same error', async () => {
   const error = '知识更新计划未通过校验：related_paths 只能包含最多 5 个已有主题'
-  jobsPayload = [{
-    id: 'job-failed', video_title: '失败视频', bvid: 'BVFAILED', status: 'failed', error,
-    created_at: '2026-01-01', artifacts: [], parts: [{
-      id: 'part-failed', part_index: 1, title: '正片', status: 'failed', artifacts: [],
-      stages: [
-        { stage: 'transcribe', status: 'completed', retries: 0 },
-        { stage: 'organize', status: 'failed', error, retries: 0 },
-      ],
-    }],
-  }]
+  jobsPayload = [
+    {
+      id: 'job-failed', video_title: '失败视频', bvid: 'BVFAILED', status: 'failed', error, profile_id: 'profile-1',
+      created_at: '2026-01-01', artifacts: [], parts: [{
+        id: 'part-failed', part_index: 1, title: '正片', status: 'failed', artifacts: [],
+        stages: [
+          { stage: 'transcribe', status: 'completed', retries: 0 },
+          { stage: 'organize', status: 'failed', error, retries: 0 },
+        ],
+      }],
+    },
+    {
+      id: 'other-profile-failed', video_title: '其他知识库失败视频', bvid: 'BVOTHER',
+      status: 'failed', error: '其他库失败', profile_id: 'profile-2', created_at: '2026-01-02', artifacts: [],
+      parts: [{
+        id: 'other-part', part_index: 1, title: '正片', status: 'failed', artifacts: [],
+        stages: [{ stage: 'organize', status: 'failed', error: '其他库失败', retries: 0 }],
+      }],
+    },
+  ]
 
   render(<App />)
 
   expect(await screen.findByText(error)).toBeInTheDocument()
   expect(screen.getAllByText(error)).toHaveLength(1)
   fireEvent.click(screen.getByRole('button', { name: '历史任务' }))
-  fireEvent.click(screen.getByRole('button', { name: '一键重试失败任务（1）' }))
+  fireEvent.click(screen.getByRole('button', { name: '一键重试当前知识库失败任务（1）' }))
   await waitFor(() => expect(fetch).toHaveBeenCalledWith(
     '/api/jobs/job-failed/retry',
     expect.objectContaining({
@@ -174,12 +184,16 @@ test('shows a stage failure only once when the job has the same error', async ()
       body: JSON.stringify({ part_id: 'part-failed', stage: 'organize' }),
     }),
   ))
+  expect(fetch).not.toHaveBeenCalledWith(
+    '/api/jobs/other-profile-failed/retry',
+    expect.anything(),
+  )
   expect(await screen.findByText('已将 1 条失败任务从各自失败阶段重新加入队列')).toBeInTheDocument()
 })
 
 test('includes transcription failures in one-click retry', async () => {
   jobsPayload = [{
-    id: 'job-asr-failed', video_title: '转写失败视频', bvid: 'BVASRFAILED', status: 'failed',
+    id: 'job-asr-failed', video_title: '转写失败视频', bvid: 'BVASRFAILED', status: 'failed', profile_id: 'profile-1',
     created_at: '2026-01-01', artifacts: [], parts: [{
       id: 'part-asr-failed', part_index: 1, title: '正片', status: 'failed', artifacts: [],
       stages: [{ stage: 'transcribe', status: 'failed', error: '转写失败', retries: 0 }],
@@ -189,7 +203,7 @@ test('includes transcription failures in one-click retry', async () => {
 
   expect(await screen.findByText('转写失败视频')).toBeInTheDocument()
   fireEvent.click(screen.getByRole('button', { name: '历史任务' }))
-  fireEvent.click(screen.getByRole('button', { name: '一键重试失败任务（1）' }))
+  fireEvent.click(screen.getByRole('button', { name: '一键重试当前知识库失败任务（1）' }))
   await waitFor(() => expect(fetch).toHaveBeenCalledWith(
     '/api/jobs/job-asr-failed/retry',
     expect.objectContaining({
@@ -307,23 +321,23 @@ test('keeps expanded markdown sections open when the parent view rerenders', asy
   expect(details).toHaveAttribute('open')
 })
 
-test('regenerates the entire knowledge base from history after confirmation', async () => {
+test('reorganizes the active knowledge base from history after confirmation', async () => {
   jobsPayload = [{
     id: 'job-regenerate', video_title: '待重建视频', bvid: 'BVREGENERATE', status: 'completed',
-    created_at: '2026-01-01', artifacts: [], parts: [],
+    created_at: '2026-01-01', profile_id: 'profile-1', artifacts: [], parts: [],
   }]
   render(<App />)
   fireEvent.click(await screen.findByRole('button', { name: '历史任务' }))
-  fireEvent.click(screen.getByRole('button', { name: '重新生成知识库' }))
+  fireEvent.click(screen.getByRole('button', { name: '重新归档当前知识库' }))
 
-  const dialog = screen.getByRole('alertdialog', { name: '确认重新生成知识库' })
+  const dialog = screen.getByRole('alertdialog', { name: '确认重新归档知识库' })
   expect(dialog).toBeInTheDocument()
-  expect(screen.getByText(/现有知识正文和全部归档主题会被永久删除/)).toBeInTheDocument()
-  expect(fetch).not.toHaveBeenCalledWith('/api/knowledge/regenerate', expect.anything())
-  fireEvent.click(screen.getByRole('button', { name: '确认删除并重新生成' }))
+  expect(screen.getByText(/转写和知识稿会保留/)).toBeInTheDocument()
+  expect(fetch).not.toHaveBeenCalledWith(expect.stringContaining('/api/knowledge/regenerate'), expect.anything())
+  fireEvent.click(screen.getByRole('button', { name: '确认重新归档' }))
 
   await waitFor(() => expect(fetch).toHaveBeenCalledWith(
-    '/api/knowledge/regenerate', expect.objectContaining({ method: 'POST' }),
+    '/api/knowledge/regenerate?profile_id=profile-1', expect.objectContaining({ method: 'POST' }),
   ))
-  expect(await screen.findByText(/已清空旧知识并重新排队：1 条任务/)).toBeInTheDocument()
+  expect(await screen.findByText(/已清空当前知识库的旧归档并重新排队：1 条任务/)).toBeInTheDocument()
 })

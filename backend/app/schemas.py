@@ -10,6 +10,8 @@ class InspectRequest(BaseModel):
 class CreateJobRequest(BaseModel):
     video_id: str
     part_ids: list[str] = Field(min_length=1)
+    profile_id: str | None = None
+    draft_policy: Literal["reuse", "regenerate"] = "reuse"
 
 
 class RetryRequest(BaseModel):

@@ -42,6 +42,12 @@ class Settings:
     def temp_dir(self) -> Path:
         return self.data_dir / "tmp"
 
+    def profile_knowledge_dir(self, profile_id: str) -> Path:
+        return self.knowledge_base_dir / "profiles" / profile_id
+
+    def profile_topics_dir(self, profile_id: str) -> Path:
+        return self.profile_knowledge_dir(profile_id) / "topics"
+
     def public_dict(self) -> dict:
         return {
             "source_output_dir": str(self.source_output_dir),
