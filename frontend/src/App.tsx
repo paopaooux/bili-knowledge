@@ -128,6 +128,7 @@ export default function App() {
   const [serviceStatus, setServiceStatus] = useState<'connecting' | 'running' | 'worker-stopped' | 'disconnected'>('connecting')
   const [page, setPage] = useState<'home' | 'history'>('home')
   const [historyQuery, setHistoryQuery] = useState('')
+  const [historyProfileId, setHistoryProfileId] = useState('all')
   const [historyStatus, setHistoryStatus] = useState<'all' | 'active' | 'completed' | 'failed'>('all')
   const [expandedHistoryJobId, setExpandedHistoryJobId] = useState<string | null>(null)
 
@@ -163,9 +164,10 @@ export default function App() {
       || (historyStatus === 'failed' && ['failed', 'cancelled'].includes(status))
     return orderedJobs.filter(job =>
       statusMatches(job.status)
-      && (!query || `${job.video_title} ${job.bvid} ${job.video_url || ''}`.toLocaleLowerCase().includes(query)),
+      && (historyProfileId === 'all' || job.profile_id === historyProfileId)
+      && (!query || `${job.video_title} ${job.bvid} ${job.video_url || ''} ${job.profile_name || ''}`.toLocaleLowerCase().includes(query)),
     )
-  }, [historyQuery, historyStatus, jobs, page])
+  }, [historyProfileId, historyQuery, historyStatus, jobs, page])
 
   const refresh = async () => {
     try { setJobs(await api.jobs()) } catch (error) { setNotice(errorText(error)) }
@@ -568,7 +570,7 @@ export default function App() {
 
       {page === 'history' && <section className="history-page">
         <div className="history-heading"><div><small>ALL PROCESSING JOBS</small><h2>历史任务</h2><p>共 {jobs.length} 条解析记录</p></div><div className="history-heading-actions">{retryableFailedJobs.length > 0 && <button className="ghost quick-retry" disabled={retryingFailedJobs} onClick={() => void retryAllFailedJobs()}>{retryingFailedJobs ? '正在批量重试…' : `一键重试当前知识库失败任务（${retryableFailedJobs.length}）`}</button>}<button className="ghost danger history-regenerate" title={activeProfileBusy ? '请等待当前知识库的队列处理完成' : '保留知识稿，重新归档当前启用的知识库'} disabled={regeneratingKnowledge || activeProfileBusy || !activeProfileJobs.length} onClick={() => setRegenerateConfirmOpen(true)}>{regeneratingKnowledge ? '正在清空并排队…' : '重新归档当前知识库'}</button></div></div>
-        <div className="history-tools"><label className="history-search"><span aria-hidden="true">⌕</span><input aria-label="搜索历史任务" value={historyQuery} onChange={event => setHistoryQuery(event.target.value)} placeholder="搜索标题或 BV 号"/>{historyQuery && <button aria-label="清空搜索" onClick={() => setHistoryQuery('')}>×</button>}</label><div className="history-status-tabs" role="group" aria-label="筛选任务状态">{([['all', '全部'], ['active', '处理中'], ['completed', '已完成'], ['failed', '失败']] as const).map(([status, label]) => <button key={status} className={historyStatus === status ? 'active' : ''} onClick={() => setHistoryStatus(status)}>{label}</button>)}</div><button className="history-refresh" onClick={() => void refresh()}>↻ 刷新</button></div>
+        <div className="history-tools"><label className="history-search"><span aria-hidden="true">⌕</span><input aria-label="搜索历史任务" value={historyQuery} onChange={event => setHistoryQuery(event.target.value)} placeholder="搜索标题、BV 号或知识库"/>{historyQuery && <button aria-label="清空搜索" onClick={() => setHistoryQuery('')}>×</button>}</label><label className="history-profile-filter"><small>知识库</small><select aria-label="筛选知识库" value={historyProfileId} onChange={event => setHistoryProfileId(event.target.value)}><option value="all">全部知识库</option>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name}{profile.is_active ? '（当前）' : ''}</option>)}</select></label><div className="history-status-tabs" role="group" aria-label="筛选任务状态">{([['all', '全部'], ['active', '处理中'], ['completed', '已完成'], ['failed', '失败']] as const).map(([status, label]) => <button key={status} className={historyStatus === status ? 'active' : ''} onClick={() => setHistoryStatus(status)}>{label}</button>)}</div><button className="history-refresh" onClick={() => void refresh()}>↻ 刷新</button></div>
         <div className="history-summary">找到 {visibleJobs.length} 条记录</div>
       </section>}
 
@@ -577,8 +579,9 @@ export default function App() {
         {!visibleJobs.length && <div className="empty">{jobs.length ? '没有符合条件的历史任务。' : '还没有任务。提交第一个视频后，处理进度会显示在这里。'}</div>}
         {visibleJobs.map(job => {
           const historyExpanded = page === 'history' && expandedHistoryJobId === job.id
+          const profileName = job.profile_name || profiles.find(profile => profile.id === job.profile_id)?.name || '未归属知识库'
           return <article className={`job-card ${page === 'history' ? 'history-job' : ''} ${historyExpanded ? 'expanded' : ''}`} key={job.id}>
-          <div className="job-head"><div><span>{job.bvid}{job.profile_name ? ` · ${job.profile_name}` : ''}</span><h3>{job.video_title}</h3><small>{page === 'history' ? '最后更新：' : ''}{new Date(page === 'history' ? (job.updated_at || job.created_at) : job.created_at).toLocaleString()}</small>{page === 'history' && job.video_url && <a className="history-source-link" href={job.video_url} target="_blank" rel="noreferrer">{job.video_url} ↗</a>}</div>
+          <div className="job-head"><div><div className="job-context"><span className="job-bvid">{job.bvid}</span><span className="job-profile">{profileName}</span></div><h3>{job.video_title}</h3><small>{page === 'history' ? '最后更新：' : ''}{new Date(page === 'history' ? (job.updated_at || job.created_at) : job.created_at).toLocaleString()}</small>{page === 'history' && job.video_url && <a className="history-source-link" href={job.video_url} target="_blank" rel="noreferrer">{job.video_url} ↗</a>}</div>
             <div className="job-head-actions"><span className={`status ${job.status}`}>{statusLabels[job.status]}</span>{page === 'history' && <button className="history-toggle" aria-expanded={historyExpanded} onClick={() => setExpandedHistoryJobId(historyExpanded ? null : job.id)}>{historyExpanded ? '收起' : '展开'}</button>}</div></div>
           {(page === 'home' || historyExpanded) && <>{job.error && !jobErrorAlreadyShownByStage(job) && <div className="error-box">{job.error}</div>}
           {job.parts.map(part => <div className="part-progress" key={part.id}>

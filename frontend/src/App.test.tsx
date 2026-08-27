@@ -3,6 +3,13 @@ import { afterEach, vi } from 'vitest'
 import App from './App'
 
 let jobsPayload: unknown[] = []
+const defaultProfiles = [{
+  id: 'profile-1', name: '个人成长与学习', mode: 'guided', scope: '学习与成长知识',
+  preferred_topics: [{ name: '学习方法', path: '个人成长/学习方法.md', description: '学习方法' }],
+  rules: { ignore_out_of_scope: false, merge_similar: true }, is_active: true,
+  version: 1, created_at: '2026-01-01', updated_at: '2026-01-01',
+}]
+let profilesPayload = defaultProfiles
 
 vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
   const url = String(input)
@@ -22,16 +29,13 @@ vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
   }]), { status: 200, headers: { 'Content-Type': 'application/json' } })
   if (url.includes('/api/knowledge/file?path=')) return new Response('# 学习方法\n\n- 间隔复习。\n  - 条件：已经理解材料。\n  - 步骤：逐渐拉长间隔。')
   if (url.includes('/api/knowledge/regenerate?profile_id=')) return new Response(JSON.stringify({ queued_jobs: 1, queued_parts: 1 }), { status: 200, headers: { 'Content-Type': 'application/json' } })
-  const payload = url.endsWith('/api/jobs') ? jobsPayload : url.endsWith('/api/knowledge/profiles') ? [{
-    id: 'profile-1', name: '个人成长与学习', mode: 'guided', scope: '学习与成长知识',
-    preferred_topics: [{ name: '学习方法', path: '个人成长/学习方法.md', description: '学习方法' }],
-    rules: { ignore_out_of_scope: false, merge_similar: true }, is_active: true,
-    version: 1, created_at: '2026-01-01', updated_at: '2026-01-01',
-  }] : { stt_model: 'qwen3.5-omni-plus', llm_model: 'test-model', source_output_dir: '/tmp/sources', knowledge_base_dir: '/tmp/kb' }
+  const payload = url.endsWith('/api/jobs') ? jobsPayload : url.endsWith('/api/knowledge/profiles')
+    ? profilesPayload
+    : { stt_model: 'qwen3.5-omni-plus', llm_model: 'test-model', source_output_dir: '/tmp/sources', knowledge_base_dir: '/tmp/kb' }
   return new Response(JSON.stringify(payload), { status: 200, headers: { 'Content-Type': 'application/json' } })
 }))
 
-afterEach(() => { jobsPayload = []; vi.clearAllMocks() })
+afterEach(() => { jobsPayload = []; profilesPayload = defaultProfiles; vi.clearAllMocks() })
 
 test('opens profile management in a separate modal', async () => {
   render(<App />)
@@ -254,6 +258,40 @@ test('shows only five recent jobs on home and all searchable jobs in history', a
   expect(screen.getByText('找到 1 条记录')).toBeInTheDocument()
   expect(screen.getByText('历史视频 6')).toBeInTheDocument()
   expect(screen.queryByText('历史视频 0')).not.toBeInTheDocument()
+})
+
+test('shows and filters history jobs by knowledge profile', async () => {
+  profilesPayload = [
+    defaultProfiles[0],
+    {
+      ...defaultProfiles[0],
+      id: 'profile-2',
+      name: '工作知识库',
+      is_active: false,
+    },
+  ]
+  jobsPayload = [
+    {
+      id: 'personal-job', video_title: '个人学习视频', bvid: 'BVPERSONAL', status: 'completed',
+      profile_id: 'profile-1', profile_name: '个人成长与学习', created_at: '2026-01-01',
+      artifacts: [], parts: [],
+    },
+    {
+      id: 'work-job', video_title: '工作方法视频', bvid: 'BVWORK', status: 'completed',
+      profile_id: 'profile-2', profile_name: '工作知识库', created_at: '2026-01-02',
+      artifacts: [], parts: [],
+    },
+  ]
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: '历史任务' }))
+
+  expect(screen.getByText('个人成长与学习', { selector: '.job-profile' })).toBeInTheDocument()
+  expect(screen.getByText('工作知识库', { selector: '.job-profile' })).toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('筛选知识库'), { target: { value: 'profile-2' } })
+
+  expect(screen.getByText('工作方法视频')).toBeInTheDocument()
+  expect(screen.queryByText('个人学习视频')).not.toBeInTheDocument()
+  expect(screen.getByText('找到 1 条记录')).toBeInTheDocument()
 })
 
 test('puts running jobs first and keeps the four history status groups', async () => {
